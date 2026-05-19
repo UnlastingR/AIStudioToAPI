@@ -4243,6 +4243,7 @@ class RequestHandler {
             if (rawModelName) {
                 trackingModel = rawModelName.replace(/^models\//, "");
             }
+            cleanPath = "/v1/openai/embeddings";
         }
 
         // Force web search and URL context for native Google requests
