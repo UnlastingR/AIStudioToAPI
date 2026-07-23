@@ -351,6 +351,12 @@ class RequestProcessor {
             }
         }
 
+        if (this._isUploadPathAndQuery(pathAndQuery)) {
+            const tempUrl = new URL(pathAndQuery, "http://dummy");
+            tempUrl.searchParams.delete("key");
+            pathAndQuery = tempUrl.pathname + tempUrl.search;
+        }
+
         let cleanPath = pathAndQuery.replace(/^\/+/, "");
         const method = requestSpec.method ? requestSpec.method.toUpperCase() : "GET";
 
@@ -381,9 +387,52 @@ class RequestProcessor {
         return finalUrl;
     }
 
+    _filterGeminiBuiltInTools(bodyObj, blockedToolKeys) {
+        if (!Array.isArray(bodyObj.tools)) {
+            return 0;
+        }
+
+        let removedCount = 0;
+        const filteredTools = [];
+
+        bodyObj.tools.forEach(tool => {
+            if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+                filteredTools.push(tool);
+                return;
+            }
+
+            const filteredTool = { ...tool };
+            blockedToolKeys.forEach(key => {
+                if (Object.prototype.hasOwnProperty.call(filteredTool, key)) {
+                    delete filteredTool[key];
+                    removedCount++;
+                }
+            });
+
+            if (Object.keys(filteredTool).length > 0) {
+                filteredTools.push(filteredTool);
+            }
+        });
+
+        if (filteredTools.length > 0) {
+            bodyObj.tools = filteredTools;
+        } else {
+            delete bodyObj.tools;
+        }
+
+        if (removedCount > 0 && bodyObj.toolConfig?.includeServerSideToolInvocations) {
+            delete bodyObj.toolConfig.includeServerSideToolInvocations;
+            if (Object.keys(bodyObj.toolConfig).length === 0) {
+                delete bodyObj.toolConfig;
+            }
+        }
+
+        return removedCount;
+    }
+
     _buildRequestConfig(requestSpec, signal) {
         const config = {
-            headers: this._sanitizeHeaders(requestSpec.headers),
+            headers: this._sanitizeHeaders(requestSpec.headers, requestSpec),
             method: requestSpec.method,
             signal,
         };
@@ -397,15 +446,17 @@ class RequestProcessor {
                 try {
                     const bodyObj = JSON.parse(requestSpec.body);
 
-                    // --- Module 1: Image/Embedding/TTS Model Filtering ---
-                    // These models do NOT support: tools, thinkingConfig, systemInstruction, response_mime_type
-                    const isImageModel = requestSpec.path.includes("-image") || requestSpec.path.includes("imagen");
-                    const isEmbeddingModel = requestSpec.path.includes("embedding");
-                    const isTtsModel = requestSpec.path.includes("tts");
-                    if (isImageModel || isEmbeddingModel || isTtsModel) {
+                    // --- Module 1: Embedding/TTS Model Filtering ---
+                    const requestPath = String(requestSpec.path || "");
+                    const isImageModel = requestPath.includes("-image") || requestPath.includes("imagen");
+                    const isGemini25ImageModel = isImageModel && requestPath.includes("2.5");
+                    const isGemini31FlashLiteImageModel = requestPath.includes("gemini-3.1-flash-lite-image");
+                    const isEmbeddingModel = requestPath.includes("embedding");
+                    const isTtsModel = requestPath.includes("tts");
+                    const toolRelatedKeys = ["tools", "toolConfig", "tool_config", "toolChoice", "tool_choice"];
+                    if (isEmbeddingModel || isTtsModel) {
                         // Remove tools
-                        const incompatibleKeys = ["toolConfig", "tool_config", "toolChoice", "tools"];
-                        incompatibleKeys.forEach(key => {
+                        toolRelatedKeys.forEach(key => {
                             if (Object.prototype.hasOwnProperty.call(bodyObj, key)) delete bodyObj[key];
                         });
                         // Remove thinkingConfig
@@ -415,10 +466,6 @@ class RequestProcessor {
                         // Remove systemInstruction
                         if (bodyObj.systemInstruction) {
                             delete bodyObj.systemInstruction;
-                        }
-                        // Remove response_mime_type
-                        if (bodyObj.generationConfig?.response_mime_type) {
-                            delete bodyObj.generationConfig.response_mime_type;
                         }
                         if (bodyObj.generationConfig?.responseMimeType) {
                             delete bodyObj.generationConfig.responseMimeType;
@@ -448,10 +495,34 @@ class RequestProcessor {
                     // --- Module 3: Robotics Model Filtering ---
                     const isComputerUseModel = requestSpec.path.includes("computer-use");
                     const isRoboticsModel = requestSpec.path.includes("robotics");
-                    if (isComputerUseModel || isRoboticsModel) {
-                        if (bodyObj.generationConfig?.responseModalities) {
-                            delete bodyObj.generationConfig.responseModalities;
+                    if (isGemini25ImageModel) {
+                        toolRelatedKeys.forEach(key => {
+                            if (Object.prototype.hasOwnProperty.call(bodyObj, key)) delete bodyObj[key];
+                        });
+                        if (bodyObj.generationConfig?.thinkingConfig) {
+                            delete bodyObj.generationConfig.thinkingConfig;
                         }
+                    }
+                    if (isGemini31FlashLiteImageModel) {
+                        const removedBuiltInTools = this._filterGeminiBuiltInTools(bodyObj, [
+                            "codeExecution",
+                            "code_execution",
+                            "googleMaps",
+                            "google_maps",
+                            "googleSearch",
+                            "google_search",
+                            "googleSearchRetrieval",
+                            "google_search_retrieval",
+                            "urlContext",
+                            "url_context",
+                        ]);
+                        if (removedBuiltInTools > 0) {
+                            Logger.debug(
+                                `Gemini 3.1 Flash Lite Image detected, filtered unsupported built-in tools: ${removedBuiltInTools}`
+                            );
+                        }
+                    }
+                    if (isImageModel || isComputerUseModel || isRoboticsModel) {
                         if (bodyObj.generationConfig?.responseMimeType) {
                             delete bodyObj.generationConfig.responseMimeType;
                         }
@@ -459,19 +530,21 @@ class RequestProcessor {
                             delete bodyObj.generationConfig.responseJsonSchema;
                         }
                     }
+                    if (isComputerUseModel || isRoboticsModel) {
+                        if (bodyObj.generationConfig?.responseModalities) {
+                            delete bodyObj.generationConfig.responseModalities;
+                        }
+                    }
 
                     // --- Module 4: Gemini 2 JSON Mode Tool Filtering ---
                     // If model starts with gemini-2 and response format is JSON, remove tools/toolConfig
                     // This prevents 400 errors as some Gemini 2 variants don't support combined Tool + Structured Output
                     const isGemini2 = requestSpec.path.match(/\/models\/gemini-2/);
-                    const isJsonMode =
-                        bodyObj.generationConfig?.responseMimeType === "application/json" ||
-                        bodyObj.generationConfig?.response_mime_type === "application/json";
+                    const isJsonMode = bodyObj.generationConfig?.responseMimeType === "application/json";
 
                     if (isGemini2 && isJsonMode) {
-                        const incompatibleKeys = ["toolConfig", "tool_config", "toolChoice", "tools"];
                         let keysRemoved = 0;
-                        incompatibleKeys.forEach(key => {
+                        toolRelatedKeys.forEach(key => {
                             if (Object.prototype.hasOwnProperty.call(bodyObj, key)) {
                                 delete bodyObj[key];
                                 keysRemoved++;
@@ -535,7 +608,7 @@ class RequestProcessor {
         return config;
     }
 
-    _sanitizeHeaders(headers) {
+    _sanitizeHeaders(headers, requestSpec = {}) {
         const sanitized = { ...headers };
         // Follow BuildProxy's forbidden list exactly
         const forbiddenHeaders = [
@@ -551,7 +624,21 @@ class RequestProcessor {
         ];
 
         forbiddenHeaders.forEach(h => delete sanitized[h]);
+        if (this._isUploadRequestSpec(requestSpec)) {
+            delete sanitized.authorization;
+            delete sanitized["x-api-key"];
+            delete sanitized["x-goog-api-key"];
+        }
         return sanitized;
+    }
+
+    _isUploadRequestSpec(requestSpec = {}) {
+        const path = String(requestSpec.url || requestSpec.path || "").toLowerCase();
+        return this._isUploadPathAndQuery(path);
+    }
+
+    _isUploadPathAndQuery(path) {
+        return path.includes("/upload/");
     }
 
     cancelOperation(operationId, requestAttemptId) {
@@ -828,7 +915,7 @@ class ProxySystem extends EventTarget {
         const headerMap = {};
         response.headers.forEach((v, k) => {
             const lowerKey = k.toLowerCase();
-            if ((lowerKey === "location" || lowerKey === "x-goog-upload-url") && v.includes("googleapis.com")) {
+            if (lowerKey === "x-goog-upload-url" && v.includes("googleapis.com")) {
                 try {
                     const urlObj = new URL(v);
                     const host = proxyHost || location.host;

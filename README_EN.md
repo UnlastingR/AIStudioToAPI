@@ -1,13 +1,13 @@
-# Google AI Studio to API Adapter
+# Google AI Studio Build App to API Adapter
 
 [中文文档](README.md) | English
 
-A tool that wraps Google AI Studio web interface to provide OpenAI API, Gemini API, and Anthropic API compatible endpoints. The service acts as a proxy, converting API requests to browser interactions with the AI Studio web interface.
+A tool that wraps the Google AI Studio Build App web interface to provide OpenAI API, Gemini API, and Anthropic API compatible endpoints. The service acts as a proxy, converting API requests into browser interactions with the AI Studio Build App interface.
 
 ## ✨ Features
 
 - 🔄 **API Compatibility**: Compatible with OpenAI API, Gemini API, and Anthropic API formats
-- 🌐 **Web Automation**: Uses browser automation to interact with AI Studio web interface
+- 🌐 **Web Automation**: Uses browser automation to interact with AI Studio Build
 - 👥 **Multi-Account Support**: Support multiple Google accounts logged in simultaneously for fast switching without re-login
 - 🔧 **Tool Calls Support**: OpenAI, Gemini, and Anthropic APIs all support Tool Calls (Function Calling)
 - 📝 **Model Support**: Access to various Gemini models through AI Studio, including image generation and TTS (text-to-speech) models
@@ -49,6 +49,12 @@ A tool that wraps Google AI Studio web interface to provide OpenAI API, Gemini A
    npm start
    ```
 
+   If the frontend assets have already been built and you only want to restart the service quickly, use:
+
+   ```bash
+   npm run quick-start
+   ```
+
    The API server will be available at `http://localhost:7860`
 
    After the service starts, you can access `http://localhost:7860` in your browser to open the web console homepage, where you can view account status and service status.
@@ -59,6 +65,7 @@ A tool that wraps Google AI Studio web interface to provide OpenAI API, Gemini A
    ```bash
    git pull
    npm install
+   npm start
    ```
 
 > ⚠ **Note:** Running directly does not support adding accounts via VNC online. You need to use the `npm run setup-auth` script to add accounts. VNC login is only available in Docker deployments.
@@ -172,12 +179,10 @@ If you need to access via a domain name or want unified management at the revers
 
 ### 🐾 Claw Cloud Run Deployment
 
-> ℹ **Claw Cloud Run announcement:** Claw Cloud Run has announced that it will discontinue its product and related services. All services will be discontinued on **May 11, 2026, 00:00 UTC**; export or back up your data before then. See the official announcement for details:
+> ℹ **Claw Cloud Run announcement:** Since **May 11, 2026, 00:00 UTC**, Claw Cloud Run has discontinued its product and related services. See the official announcement for details:
 > [Announcement](https://question.run.claw.cloud/questions/10010000000003261)
 
-Deploy directly on Claw Cloud Run, a fully managed container platform.
-
-> 📖 For detailed deployment instructions, see: [Deploy on Claw Cloud Run](docs/en/claw-cloud-run.md)
+> 📖 For the legacy deployment guide, see: [Deploy on Claw Cloud Run](docs/en/claw-cloud-run.md)
 
 ### 🦓 Zeabur Deployment
 
@@ -190,26 +195,28 @@ Deploy directly on Claw Cloud Run, a fully managed container platform.
 
 ### 🤖 OpenAI-Compatible API
 
-This endpoint is processed and then forwarded to the official Gemini API format endpoint.
+This endpoint is processed and then forwarded to the Gemini API format endpoint.
 
 - `GET /v1/models`: List models.
 - `POST /v1/chat/completions`: Chat completion and image generation, supports non-streaming, real streaming, and fake streaming.
+- `POST /v1/embeddings`: Generate text embedding vectors.
 - `POST /v1/responses`: OpenAI Responses API compatible endpoint for conversation generation, does not support image generation, and supports non-streaming, real streaming, and fake streaming.
 - `POST /v1/responses/input_tokens`: Count input tokens for an OpenAI Responses API request.
 
 ### ♊ Gemini Native API Format
 
-This endpoint is forwarded to the official Gemini API format endpoint.
+This endpoint is forwarded to the Gemini API format endpoint.
 
 - `GET /v1beta/models`: List available Gemini models.
 - `POST /v1beta/models/{model_name}:generateContent`: Generate content, images, and speech.
 - `POST /v1beta/models/{model_name}:streamGenerateContent`: Stream content, image, and speech generation, supports real and fake streaming.
+- `POST /v1beta/models/{model_name}:embedContent`: Generate a single text embedding vector.
 - `POST /v1beta/models/{model_name}:batchEmbedContents`: Batch generate text embedding vectors.
 - `POST /v1beta/models/{model_name}:predict`: Imagen series models image generation.
 
 ### 👤 Anthropic Compatible API
 
-This endpoint forwards requests to the official Gemini API format endpoint.
+This endpoint forwards requests to the Gemini API format endpoint.
 
 - `GET /v1/models`: List models.
 - `POST /v1/messages`: Chat message completions, supports non-streaming, real streaming, and fake streaming.
@@ -266,7 +273,7 @@ Usage:
 | `MAX_CONTEXTS`                  | Maximum number of accounts that can be logged in simultaneously. Accounts logged in simultaneously can switch faster without re-login. Higher values consume more memory (approx: 1 account ~700MB, 2 accounts ~950MB, 3 accounts ~1100MB). Set to `0` for unlimited. | `1`       |
 | `HTTP_PROXY`                    | HTTP proxy address for accessing Google services.                                                                                                                                                                                                                     | None      |
 | `HTTPS_PROXY`                   | HTTPS proxy address for accessing Google services.                                                                                                                                                                                                                    | None      |
-| `NO_PROXY`                      | Comma-separated list of addresses to bypass the proxy. The project automatically bypasses local addresses (localhost, 127.0.0.1 and 0.0.0.0), so manual local bypass configuration is usually not required.                                                           | None      |
+| `NO_PROXY`                      | Comma-separated list of addresses to bypass the proxy. The project automatically bypasses local addresses (localhost, 127.0.0.1, ::, ::1 and 0.0.0.0), so manual local bypass configuration is usually not required.                                                  | None      |
 
 #### 🗒️ Other Configuration
 
@@ -277,6 +284,7 @@ Usage:
 | `SAFETY_SETTINGS_THRESHOLD` | Safety settings level. Official docs: [Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings)                                                                        | `OFF`         |
 | `FORCE_THINKING`            | Force enable thinking mode for all requests.                                                                                                                                          | `false`       |
 | `FORCE_WEB_SEARCH`          | Force enable web search for all requests.                                                                                                                                             | `false`       |
+| `FORCE_CODE_EXECUTION`      | Force enable code execution for all requests.                                                                                                                                         | `false`       |
 | `FORCE_URL_CONTEXT`         | Force enable URL context for all requests.                                                                                                                                            | `false`       |
 | `CAMOUFOX_EXECUTABLE_PATH`  | Path to the Camoufox browser executable (supports both absolute and relative paths). Only required if manually downloaded.                                                            | Auto-detected |
 
@@ -302,7 +310,37 @@ Edit `configs/models.json` to customize available models and their settings.
 >
 > Streaming mode can also be overridden with `-real` or `-fake`. This override has higher priority than the system streaming mode, but it only takes effect for streaming requests. For example: `gemini-3-flash-preview-fake`. When used together with a thinking suffix, the streaming suffix should come after the thinking suffix, for example: `gemini-3-flash-preview-minimal-fake` or `gemini-3-flash-preview(minimal)-real`.
 >
-> Web search can also be forced on by appending `-search` to the end of the model name. For example: `gemini-3-flash-preview-search`. When combined with other suffixes, `-search` must be the final suffix; the full combined order remains `thinking -> streaming -> search`, for example: `gemini-3-flash-preview-minimal-search`, `gemini-3-flash-preview-real-search`, or `gemini-3-flash-preview(minimal)-fake-search`.
+> Web search and code execution can also be forced on with model suffixes: append `-search` for web search and `-code` for code execution. For example: `gemini-3-flash-preview-search` or `gemini-3-flash-preview-code`. When combined with other suffixes, built-in tool suffixes should come last; the full combined order is `thinking -> streaming -> built-in tools`, for example: `gemini-3-flash-preview-minimal-search`, `gemini-3-flash-preview-real-code`, or `gemini-3-flash-preview(minimal)-fake-search-code`.
+
+### 🌐 Sticky Per-Account Proxy
+
+Create `proxylist.txt` in the project root to enable sticky per-account proxies. Add one HTTP proxy per line. Supported formats:
+
+```text
+user:pass@ip:port
+ip:port:user:pass
+ip:port
+http://user:pass@ip:port
+```
+
+When `proxylist.txt` contains at least one valid proxy, the service writes `proxy_mapping.json` and assigns the first free proxy to each active account. Existing account assignments are kept as long as the account still exists and the proxy is still present in `proxylist.txt`. If an account or proxy is removed, its stale mapping is removed automatically. If there are more active accounts than proxies, accounts without an assigned proxy will not start until more proxies are added.
+
+`proxy_mapping.json` is created in the project root. It is a JSON object that maps an account key to the original proxy line, for example:
+
+```json
+{
+  "user@example.com": "user:pass@1.2.3.4:8080",
+  "auth-1": "5.6.7.8:8080"
+}
+```
+
+VNC-based account binding also uses sticky proxies. A new VNC login session reserves a free proxy before opening the browser, and after the account is saved that proxy is persisted to the detected account in `proxy_mapping.json`. If sticky proxy mode is enabled and no free proxy is available, the VNC session fails instead of falling back to the server's direct IP.
+
+Sticky proxies use the same bypass rules as `HTTP_PROXY` / `HTTPS_PROXY`: local addresses are bypassed by default, and custom entries can be added with `NO_PROXY`:
+
+```bash
+NO_PROXY=internal.example.com,10.0.0.0/8
+```
 
 ## 📄 License
 

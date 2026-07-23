@@ -1,13 +1,13 @@
-# Google AI Studio to API Adapter
+# Google AI Studio Build App to API Adapter
 
 中文文档 | [English](README_EN.md)
 
-一个将 Google AI Studio 网页端封装为兼容 OpenAI API、Gemini API 和 Anthropic API 的工具。该服务将充当代理，将 API 请求转换为与 AI Studio 网页界面的浏览器交互。
+一个将 Google AI Studio Build App 网页端封装为兼容 OpenAI API、Gemini API 和 Anthropic API 的工具。该服务将充当代理，将 API 请求转换为与 AI Studio Build App 应用界面的浏览器交互。
 
 ## ✨ 功能特性
 
 - 🔄 **API 兼容性**：同时兼容 OpenAI API、Gemini API 和 Anthropic API 格式
-- 🌐 **网页自动化**：使用浏览器自动化技术与 AI Studio 网页界面交互
+- 🌐 **网页自动化**：使用浏览器自动化技术与 AI Studio Build 交互
 - 👥 **多账号支持**：支持多个 Google 账号同时登录，快速切换无需重新登录
 - 🔧 **支持工具调用**：OpenAI、Gemini 和 Anthropic 接口均支持 Tool Calls (Function Calling)
 - 📝 **模型支持**：通过 AI Studio 访问各种 Gemini 模型，包括生图模型和 TTS 语音合成模型
@@ -49,6 +49,12 @@
    npm start
    ```
 
+   如果已经构建过前端资源，后续只想快速重启服务，可使用：
+
+   ```bash
+   npm run quick-start
+   ```
+
    API 服务将在 `http://localhost:7860` 上运行。
 
    服务启动后，您可以在浏览器中访问 `http://localhost:7860` 打开 Web 控制台主页，在这里可以查看账号状态和服务状态。
@@ -59,6 +65,7 @@
    ```bash
    git pull
    npm install
+   npm start
    ```
 
 > ⚠ **注意：** 直接运行不支持通过 VNC 在线添加账号，需要使用 `npm run setup-auth` 脚本添加账号。当前 VNC 登录功能仅在 Docker 容器中可用。
@@ -174,12 +181,10 @@ services:
 
 ### 🐾 Claw Cloud Run 部署
 
-> ℹ **Claw Cloud Run 公告：** Claw Cloud Run 已宣布停止产品及相关服务；所有服务将于 **2026/05/11 00:00 UTC** 停止，建议在此之前导出或备份数据。详情请参阅官方公告：
+> ℹ **Claw Cloud Run 公告：** 自 **2026/05/11 00:00 UTC** 起，Claw Cloud Run 已停止产品及相关服务。详情请参阅官方公告：
 > [公告](https://question.run.claw.cloud/questions/10010000000003261)
 
-支持直接部署到 Claw Cloud Run，全托管的容器平台。
-
-> 📖 详细部署说明请参阅：[部署到 Claw Cloud Run](docs/zh/claw-cloud-run.md)
+> 📖 旧版部署教程请参阅：[部署到 Claw Cloud Run](docs/zh/claw-cloud-run.md)
 
 ### 🦓 Zeabur 部署
 
@@ -192,26 +197,28 @@ services:
 
 ### 🤖 OpenAI 兼容 API
 
-此端点处理后转发到官方 Gemini API 格式端点。
+此端点处理后转发到 Gemini API 格式端点。
 
 - `GET /v1/models`: 列出模型。
 - `POST /v1/chat/completions`: 聊天补全和图片生成，支持非流式、真流式和假流式。
+- `POST /v1/embeddings`: 生成文本嵌入向量。
 - `POST /v1/responses`: OpenAI Responses API 兼容接口，用于对话生成，不支持图像生成，支持非流式、真流式和假流式。
 - `POST /v1/responses/input_tokens`: 计算 OpenAI Responses API 请求的输入 token 数量。
 
 ### ♊ Gemini 原生 API 格式
 
-此端点转发到官方 Gemini API 格式端点。
+此端点转发到 Gemini API 格式端点。
 
 - `GET /v1beta/models`: 列出可用的 Gemini 模型。
 - `POST /v1beta/models/{model_name}:generateContent`: 生成内容、图片和语音。
 - `POST /v1beta/models/{model_name}:streamGenerateContent`: 流式生成内容、图片和语音，支持真流式和假流式。
+- `POST /v1beta/models/{model_name}:embedContent`: 生成单条文本嵌入向量。
 - `POST /v1beta/models/{model_name}:batchEmbedContents`: 批量生成文本嵌入向量。
 - `POST /v1beta/models/{model_name}:predict`: Imagen 系列模型图像生成。
 
 ### 👤 Anthropic 兼容 API
 
-此端点处理后转发到官方 Gemini API 格式端点。
+此端点处理后转发到 Gemini API 格式端点。
 
 - `GET /v1/models`: 列出模型。
 - `POST /v1/messages`: 聊天消息补全，支持非流式、真流式和假流式。
@@ -268,7 +275,7 @@ services:
 | `MAX_CONTEXTS`                  | 最大同时登录的账号数量。同时登录的账号切换更快，无需重新登录。数值越大内存消耗越高（约：1 个账号 ~700MB，2 个账号 ~950MB，3 个账号 ~1100MB）。设为 `0` 表示无限制。 | `1`       |
 | `HTTP_PROXY`                    | 用于访问 Google 服务的 HTTP 代理地址。                                                                                                                              | 无        |
 | `HTTPS_PROXY`                   | 用于访问 Google 服务的 HTTPS 代理地址。                                                                                                                             | 无        |
-| `NO_PROXY`                      | 不经过代理的地址列表（逗号分隔）。项目已内置自动绕过本地地址（localhost, 127.0.0.1, 0.0.0.0），通常无需手动配置本地绕过。                                           | 无        |
+| `NO_PROXY`                      | 不经过代理的地址列表（逗号分隔）。项目已内置自动绕过本地地址（localhost, 127.0.0.1, ::, ::1, 0.0.0.0），通常无需手动配置本地绕过。                                  | 无        |
 
 #### 🗒️ 其他配置
 
@@ -279,6 +286,7 @@ services:
 | `SAFETY_SETTINGS_THRESHOLD` | 安全设置的等级。官方说明：[Safety settings](https://ai.google.dev/gemini-api/docs/safety-settings?hl=zh-cn) | `OFF`    |
 | `FORCE_THINKING`            | 强制为所有请求启用思考模式。                                                                                | `false`  |
 | `FORCE_WEB_SEARCH`          | 强制为所有请求启用网络搜索。                                                                                | `false`  |
+| `FORCE_CODE_EXECUTION`      | 强制为所有请求启用代码执行。                                                                                | `false`  |
 | `FORCE_URL_CONTEXT`         | 强制为所有请求启用 URL 上下文。                                                                             | `false`  |
 | `CAMOUFOX_EXECUTABLE_PATH`  | Camoufox 浏览器的可执行文件路径（支持绝对或相对路径）。仅在手动下载浏览器时需配置。                         | 自动检测 |
 
@@ -304,7 +312,37 @@ services:
 >
 > 真假流式也支持通过模型名后缀覆盖，支持追加 `-real` 或 `-fake`。该后缀优先级高于系统的真假流式，但只会在流式请求中生效。例如：`gemini-3-flash-preview-fake`。若和思考后缀同时使用，真假流后缀应放在思考后缀之后，例如：`gemini-3-flash-preview-minimal-fake` 或 `gemini-3-flash-preview(minimal)-real`。
 >
-> 联网搜索也支持通过模型名后缀强制开启，支持在模型名最后追加 `-search`。例如：`gemini-3-flash-preview-search`。若和其他后缀同时使用，`-search` 必须放在最末尾；完整组合顺序仍为“思考 -> 流式 -> 搜索”，例如：`gemini-3-flash-preview-minimal-search`、`gemini-3-flash-preview-real-search` 或 `gemini-3-flash-preview(minimal)-fake-search`。
+> 联网搜索和代码执行也支持通过模型名后缀强制开启：联网搜索追加 `-search`，代码执行追加 `-code`。例如：`gemini-3-flash-preview-search` 或 `gemini-3-flash-preview-code`。若和其他后缀同时使用，内置工具后缀放在最后；完整组合顺序为“思考 -> 流式 -> 内置工具”，例如：`gemini-3-flash-preview-minimal-search`、`gemini-3-flash-preview-real-code` 或 `gemini-3-flash-preview(minimal)-fake-search-code`。
+
+### 🌐 账号固定代理
+
+在项目根目录创建 `proxylist.txt` 即可启用账号固定代理。每行填写一个 HTTP 代理，支持以下格式：
+
+```text
+user:pass@ip:port
+ip:port:user:pass
+ip:port
+http://user:pass@ip:port
+```
+
+当 `proxylist.txt` 至少包含一个有效代理时，服务会写入 `proxy_mapping.json`，并为每个有效账号分配第一个空闲代理。只要账号仍然存在、代理也仍然保留在 `proxylist.txt` 中，已有绑定就会继续复用。如果账号或代理被移除，对应的旧映射会自动清理。如果有效账号数量多于代理数量，没有分配到代理的账号将无法启动，直到添加更多代理。
+
+`proxy_mapping.json` 会生成在项目根目录，格式是“账号标识 -> 原始代理行”的 JSON 对象，例如：
+
+```json
+{
+  "user@example.com": "user:pass@1.2.3.4:8080",
+  "auth-1": "5.6.7.8:8080"
+}
+```
+
+基于 VNC 的账号绑定也会使用固定代理。新的 VNC 登录会先预留一个空闲代理再打开浏览器，账号保存后会把该代理持久化绑定到检测到的账号。如果已启用账号固定代理但没有空闲代理，VNC 会直接返回错误，而不会回退到服务器直连 IP。
+
+账号固定代理使用与 `HTTP_PROXY` / `HTTPS_PROXY` 相同的绕过规则：默认绕过本地地址，也可以通过 `NO_PROXY` 添加自定义绕过项：
+
+```bash
+NO_PROXY=internal.example.com,10.0.0.0/8
+```
 
 ## 📄 许可证
 

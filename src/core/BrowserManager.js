@@ -11,6 +11,7 @@ const { firefox } = require("playwright");
 const os = require("os");
 
 const { parseProxyFromEnv } = require("../utils/ProxyUtils");
+const StickyProxyManager = require("../utils/StickyProxyManager");
 const {
     AuthExpiredError,
     isAuthExpiredError,
@@ -19,6 +20,10 @@ const {
 } = require("../utils/CustomErrors");
 
 const WS_INIT_TIMEOUT_MS = 120000;
+const FIREFOX_DOH_DISABLED_PREFS = {
+    "network.trr.mode": 5,
+    "network.trr.uri": "",
+};
 
 /**
  * Browser Manager Module
@@ -29,6 +34,8 @@ class BrowserManager {
         this.logger = logger;
         this.config = config;
         this.authSource = authSource;
+        this.stickyProxyManager = new StickyProxyManager(logger, authSource);
+        this.stickyProxyManager.isEnabled();
         this.browser = null;
 
         // Multi-context architecture: Store all initialized contexts
@@ -55,6 +62,9 @@ class BrowserManager {
 
         // ConnectionRegistry reference (set after construction to avoid circular dependency)
         this.connectionRegistry = null;
+        this._onAuthQueuesDrained = null;
+        this._isSystemBusyProvider = null;
+        this.pendingContextClosures = new Map();
 
         // Background wakeup service status (instance-level, tracks this.page)
         // Prevents multiple BackgroundWakeup instances from running simultaneously
@@ -69,7 +79,7 @@ class BrowserManager {
         this._wsInitState = new Map();
 
         // Target URL for AI Studio app
-        this.targetUrl = "https://ai.studio/apps/fa9cb8e6-4d92-4fb6-a2b1-b947405c22ae";
+        this.targetUrl = "https://ai.studio/apps/cab9ab6c-44f9-4e7a-8972-037f8ae177ab";
 
         // Firefox/Camoufox does not use Chromium-style command line args.
         // We keep this empty; Camoufox has its own anti-fingerprinting optimizations built-in.
@@ -104,6 +114,7 @@ class BrowserManager {
             "network.dns.disablePrefetch": true, // Disable DNS prefetching
             "network.http.speculative-parallel-limit": 0, // Disable speculative connections
             "network.prefetch-next": false, // Disable link prefetching
+            ...FIREFOX_DOH_DISABLED_PREFS, // Disable DoH/TRR to respect system DNS/hosts
             "permissions.default.geo": 0, // 0 = Always deny geolocation
             "services.sync.enabled": false, // Disable Firefox Sync
             "toolkit.cosmeticAnimations.enabled": false, // Disable UI animations
@@ -111,28 +122,6 @@ class BrowserManager {
             "toolkit.telemetry.enabled": false, // Disable telemetry
             "toolkit.telemetry.unified": false, // Disable unified telemetry
         };
-
-        if (this.config.browserExecutablePath) {
-            this.browserExecutablePath = this.config.browserExecutablePath;
-        } else {
-            const platform = os.platform();
-            if (platform === "linux") {
-                this.browserExecutablePath = path.join(process.cwd(), "camoufox-linux", "camoufox");
-            } else if (platform === "win32") {
-                this.browserExecutablePath = path.join(process.cwd(), "camoufox", "camoufox.exe");
-            } else if (platform === "darwin") {
-                this.browserExecutablePath = path.join(
-                    process.cwd(),
-                    "camoufox-macos",
-                    "Camoufox.app",
-                    "Contents",
-                    "MacOS",
-                    "camoufox"
-                );
-            } else {
-                throw new Error(`Unsupported operating system: ${platform}`);
-            }
-        }
     }
 
     get currentAuthIndex() {
@@ -143,12 +132,57 @@ class BrowserManager {
         this._currentAuthIndex = value;
     }
 
+    _getBrowserExecutablePath() {
+        if (this.config.browserExecutablePath) {
+            return this.config.browserExecutablePath;
+        }
+
+        const platform = os.platform();
+        if (platform === "linux") {
+            return path.join(process.cwd(), "camoufox-linux", "camoufox");
+        }
+        if (platform === "win32") {
+            return path.join(process.cwd(), "camoufox", "camoufox.exe");
+        }
+        if (platform === "darwin") {
+            return path.join(process.cwd(), "camoufox-macos", "Camoufox.app", "Contents", "MacOS", "camoufox");
+        }
+
+        throw new Error(`Unsupported operating system: ${platform}`);
+    }
+
     /**
      * Set the ConnectionRegistry reference (called after construction to avoid circular dependency)
      * @param {ConnectionRegistry} connectionRegistry - The ConnectionRegistry instance
      */
     setConnectionRegistry(connectionRegistry) {
+        if (this.connectionRegistry && this._onAuthQueuesDrained) {
+            this.connectionRegistry.off("authQueuesDrained", this._onAuthQueuesDrained);
+        }
         this.connectionRegistry = connectionRegistry;
+        if (this.connectionRegistry) {
+            this._onAuthQueuesDrained = authIndex => {
+                this._closePendingContextIfIdle(authIndex).catch(error => {
+                    this.logger.error(
+                        `[ContextPool] Failed to close pending context #${authIndex} after queue drain: ${error.message}`
+                    );
+                });
+            };
+            this.connectionRegistry.on("authQueuesDrained", this._onAuthQueuesDrained);
+        }
+    }
+
+    setSystemBusyProvider(provider) {
+        this._isSystemBusyProvider = typeof provider === "function" ? provider : null;
+    }
+
+    _isSystemBusy() {
+        try {
+            return this._isSystemBusyProvider?.() === true;
+        } catch (error) {
+            this.logger.warn(`[ContextPool] Failed to read system busy state: ${error.message}`);
+            return false;
+        }
     }
 
     /**
@@ -173,6 +207,126 @@ class BrowserManager {
         }
     }
 
+    _isCriticalPageError(error) {
+        const msg = error?.message || "";
+        return (
+            msg.includes("Execution context was destroyed") ||
+            msg.includes("Target page, context or browser has been closed") ||
+            msg.includes("Protocol error") ||
+            msg.includes("Navigation failed because page was closed")
+        );
+    }
+
+    _throwIfContextInitAborted(authIndex, isBackgroundTask = false, logPrefix = null, action = "Context init") {
+        if (this.abortedContexts.has(authIndex)) {
+            if (logPrefix) {
+                this.logger.info(`${logPrefix} ${action} aborted (context marked for deletion)`);
+            }
+            throw new ContextAbortedError(authIndex, "marked for deletion");
+        }
+
+        if (isBackgroundTask && this._backgroundPreloadAbort) {
+            if (logPrefix) {
+                this.logger.info(`${logPrefix} ${action} aborted (background preload aborted)`);
+            }
+            throw new ContextAbortedError(authIndex, "background preload aborted");
+        }
+    }
+
+    async _clickButtonByTextIfVisible(page, text, logPrefix = "[Browser]", debugName = "button") {
+        try {
+            // Use DOM operation to find and click button
+            const clicked = await page.evaluate(text => {
+                // eslint-disable-next-line no-undef
+                const buttons = document.querySelectorAll("button");
+                for (const btn of buttons) {
+                    // Check if the element occupies space (simple visibility check)
+                    const rect = btn.getBoundingClientRect();
+                    const isVisible = rect.width > 0 && rect.height > 0;
+
+                    if (isVisible) {
+                        const btnText = (btn.innerText || "").trim();
+                        if (btnText === text) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }, text);
+
+            return clicked;
+        } catch (error) {
+            // Element not visible or doesn't exist is expected here,
+            // but propagate clearly critical browser/page issues.
+            if (error && error.message) {
+                const msg = error.message;
+                if (this._isCriticalPageError(error)) {
+                    throw error;
+                }
+                if (this.logger && typeof this.logger.debug === "function") {
+                    this.logger.debug(`${logPrefix} Ignored error while checking ${debugName}: ${msg}`);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    async _clickLaunchButtonIfVisible(page, logPrefix = "[Browser]") {
+        try {
+            this.logger.debug(`${logPrefix} 🔍 Checking for Launch button...`);
+
+            const clicked = await page.evaluate(() => {
+                const isVisible = element => {
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const getText = element => (element.innerText || element.textContent || "").trim();
+                const hasLaunchText = element => getText(element).includes("Launch");
+                const clickTarget = element => {
+                    const target = element.closest("button, [role='button']") || element;
+                    target.click();
+                    return true;
+                };
+
+                // eslint-disable-next-line no-undef
+                const controls = Array.from(document.querySelectorAll("button, div[role='button']"));
+                for (const control of controls) {
+                    if (!isVisible(control)) continue;
+
+                    const ariaLabel = control.getAttribute("aria-label") || "";
+                    if (hasLaunchText(control) || ariaLabel.includes("Launch")) {
+                        return clickTarget(control);
+                    }
+                }
+
+                // eslint-disable-next-line no-undef
+                const spans = Array.from(document.querySelectorAll("button span, [role='button'] span"));
+                for (const span of spans) {
+                    if (!isVisible(span)) continue;
+                    if (hasLaunchText(span)) {
+                        return clickTarget(span);
+                    }
+                }
+
+                return false;
+            });
+
+            if (clicked) {
+                this.logger.info(`${logPrefix} Launch button clicked successfully`);
+                return true;
+            }
+        } catch (error) {
+            if (this._isCriticalPageError(error)) {
+                throw error;
+            }
+            this.logger.warn(`${logPrefix} ⚠️ Error while checking for Launch button: ${error.message}`);
+        }
+
+        return false;
+    }
+
     /**
      * Helper: Wait for WebSocket initialization with log monitoring
      * Supports abort for background tasks and context deletion
@@ -190,26 +344,19 @@ class BrowserManager {
         authIndex = -1,
         isBackgroundTask = false
     ) {
-        this.logger.info(`${logPrefix} ⏳ Waiting for WebSocket initialization (timeout: ${timeout / 1000}s)...`);
+        this.logger.info(
+            `${logPrefix} ⏳ Waiting for Continue/Launch button or WebSocket initialization (timeout: ${timeout / 1000}s)...`
+        );
 
         const startTime = Date.now();
         const checkInterval = 1000; // Check every 1 second
+        let continueClicked = false;
+        let skipClicked = false;
+        let iteration = 0;
 
         try {
             while (Date.now() - startTime < timeout) {
-                // Check if this specific context was marked for abort
-                if (this.abortedContexts.has(authIndex)) {
-                    this.logger.info(`${logPrefix} WebSocket wait aborted (context marked for deletion)`);
-                    throw new ContextAbortedError(authIndex, "marked for deletion");
-                }
-
-                // Check if background preload was aborted (only for background tasks)
-                if (isBackgroundTask && this._backgroundPreloadAbort) {
-                    this.logger.info(`${logPrefix} WebSocket wait aborted (background preload aborted)`);
-                    throw new Error(
-                        `Context initialization aborted for index ${authIndex} (background preload aborted)`
-                    );
-                }
+                this._throwIfContextInitAborted(authIndex, isBackgroundTask, logPrefix, "WebSocket wait");
 
                 // Read state fresh each iteration
                 const state = this._wsInitState.get(authIndex);
@@ -223,6 +370,36 @@ class BrowserManager {
                 if (state && state.failed) {
                     this.logger.warn(`${logPrefix} Initialization failed`);
                     return false;
+                }
+
+                if (!continueClicked) {
+                    const continueText = "Continue to the app";
+                    continueClicked = await this._clickButtonByTextIfVisible(
+                        page,
+                        continueText,
+                        logPrefix,
+                        `popup "${continueText}"`
+                    );
+                    if (continueClicked) {
+                        this.logger.info(`${logPrefix} Found "${continueText}" button, clicking...`);
+                    }
+                }
+
+                if (!skipClicked) {
+                    const skipText = "Skip";
+                    skipClicked = await this._clickButtonByTextIfVisible(
+                        page,
+                        skipText,
+                        logPrefix,
+                        `popup "${skipText}"`
+                    );
+                    if (skipClicked) {
+                        this.logger.info(`${logPrefix} Found "${skipText}" button, clicking...`);
+                    }
+                }
+
+                if (iteration % 5 === 0) {
+                    await this._clickLaunchButtonIfVisible(page, logPrefix);
                 }
 
                 // Check for page errors
@@ -243,6 +420,7 @@ class BrowserManager {
                     }
                 }
                 // Wait before next check
+                iteration++;
                 await page.waitForTimeout(checkInterval);
             }
 
@@ -250,8 +428,8 @@ class BrowserManager {
             this.logger.error(`${logPrefix} ⏱️ WebSocket initialization timeout after ${timeout / 1000}s`);
             return false;
         } catch (error) {
-            // If it's an abort error, re-throw it so the caller can handle it properly
-            if (isContextAbortedError(error)) {
+            // Re-throw aborts and critical page/browser errors so callers keep the original failure reason.
+            if (isContextAbortedError(error) || this._isCriticalPageError(error)) {
                 throw error;
             }
             // For other errors, log and return false
@@ -745,171 +923,6 @@ class BrowserManager {
     }
 
     /**
-     * Helper: Handle various popups with intelligent detection
-     * Uses short polling instead of long hard-coded timeouts
-     * @param {Page} page - The page object to check for popups
-     * @param {string} logPrefix - Log prefix for messages (e.g., "[Browser]" or "[Reconnect]")
-     */
-    async _handlePopups(page, logPrefix = "[Browser]") {
-        this.logger.debug(`${logPrefix} 🔍 Starting intelligent popup detection (max 6s)...`);
-
-        const popupConfigs = [
-            {
-                logFound: `${logPrefix} Found "Continue to the app" button, clicking...`,
-                name: "Continue to the app",
-                text: "Continue to the app",
-            },
-        ];
-
-        // Polling-based detection with smart exit conditions
-        // - Initial wait: give popups time to render after page load
-        // - Consecutive idle tracking: exit after N consecutive iterations with no new popups
-        const maxIterations = 12; // Max polling iterations
-        const pollInterval = 500; // Interval between polls (ms)
-        const minIterations = 6; // Min iterations (3s), ensure slow popups have time to load
-        const idleThreshold = 4; // Exit after N consecutive iterations with no new popups
-        const handledPopups = new Set();
-        let consecutiveIdleCount = 0; // Counter for consecutive idle iterations
-
-        for (let i = 0; i < maxIterations; i++) {
-            let foundAny = false;
-
-            for (const popup of popupConfigs) {
-                if (handledPopups.has(popup.name)) continue;
-
-                try {
-                    // Use DOM operation to find and click button
-                    const clicked = await page.evaluate(text => {
-                        // eslint-disable-next-line no-undef
-                        const buttons = document.querySelectorAll("button");
-                        for (const btn of buttons) {
-                            // Check if the element occupies space (simple visibility check)
-                            const rect = btn.getBoundingClientRect();
-                            const isVisible = rect.width > 0 && rect.height > 0;
-
-                            if (isVisible) {
-                                const btnText = (btn.innerText || "").trim();
-                                if (btnText === text) {
-                                    btn.click();
-                                    return true;
-                                }
-                            }
-                        }
-                        return false;
-                    }, popup.text);
-
-                    if (clicked) {
-                        this.logger.info(popup.logFound);
-                        handledPopups.add(popup.name);
-                        foundAny = true;
-
-                        // "Continue to the app" confirms entry, exit popup detection early
-                        if (popup.name === "Continue to the app") {
-                            return;
-                        }
-
-                        // Short pause after clicking to let next popup appear
-                        await page.waitForTimeout(800);
-                    }
-                } catch (error) {
-                    // Element not visible or doesn't exist is expected here,
-                    // but propagate clearly critical browser/page issues.
-                    if (error && error.message) {
-                        const msg = error.message;
-                        if (
-                            msg.includes("Execution context was destroyed") ||
-                            msg.includes("Target page, context or browser has been closed") ||
-                            msg.includes("Protocol error") ||
-                            msg.includes("Navigation failed because page was closed")
-                        ) {
-                            throw error;
-                        }
-                        if (this.logger && typeof this.logger.debug === "function") {
-                            this.logger.debug(
-                                `${logPrefix} Ignored error while checking popup "${popup.name}": ${msg}`
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Update consecutive idle counter
-            if (foundAny) {
-                consecutiveIdleCount = 0; // Found popup, reset counter
-            } else {
-                consecutiveIdleCount++;
-            }
-
-            // Exit conditions:
-            // 1. Must have completed minimum iterations (ensure slow popups have time to load)
-            // 2. Consecutive idle count exceeds threshold (no new popups appearing)
-            if (i >= minIterations - 1 && consecutiveIdleCount >= idleThreshold) {
-                this.logger.debug(
-                    `${logPrefix} Popup detection complete (${i + 1} iterations, ${handledPopups.size} popups handled)`
-                );
-                break;
-            }
-
-            if (i < maxIterations - 1) {
-                await page.waitForTimeout(pollInterval);
-            }
-        }
-
-        // Log final summary
-        if (handledPopups.size === 0) {
-            this.logger.info(`${logPrefix} No popups detected during scan`);
-        } else {
-            this.logger.info(
-                `${logPrefix} Popup detection complete: handled ${handledPopups.size} popup(s) - ${Array.from(handledPopups).join(", ")}`
-            );
-        }
-    }
-
-    /**
-     * Helper: Try to click Launch button if it exists on the page
-     * This is not a popup, but a page button that may need to be clicked
-     * @param {Page} page - The page object to check for Launch button
-     * @param {string} logPrefix - Log prefix for messages (e.g., "[Browser]" or "[Reconnect]")
-     */
-    async _tryClickLaunchButton(page, logPrefix = "[Browser]") {
-        try {
-            this.logger.debug(`${logPrefix} 🔍 Checking for Launch button...`);
-
-            // Try to find Launch button with multiple selectors
-            const launchSelectors = [
-                'button:text("Launch")',
-                'button:has-text("Launch")',
-                'button[aria-label*="Launch"]',
-                'button span:has-text("Launch")',
-                'div[role="button"]:has-text("Launch")',
-            ];
-
-            let clicked = false;
-            for (const selector of launchSelectors) {
-                try {
-                    const element = page.locator(selector).first();
-                    if (await element.isVisible({ timeout: 2000 })) {
-                        this.logger.debug(`${logPrefix} Found Launch button with selector: ${selector}`);
-                        await element.click({ force: true, timeout: 5000 });
-                        this.logger.info(`${logPrefix} Launch button clicked successfully`);
-                        clicked = true;
-                        await page.waitForTimeout(1000);
-                        break;
-                    }
-                } catch (e) {
-                    // Continue to next selector
-                }
-            }
-
-            if (!clicked) {
-                this.logger.info(`${logPrefix} No Launch button found`);
-            }
-        } catch (error) {
-            this.logger.warn(`${logPrefix} ⚠️ Error while checking for Launch button: ${error.message}`);
-        }
-    }
-
-    /**
      * Feature: Background Health Monitor (The "Scavenger")
      * Periodically cleans up popups and keeps the session alive.
      * In multi-context mode, stores the interval in the context data.
@@ -1008,7 +1021,15 @@ class BrowserManager {
                             "div.cdk-global-overlay-wrapper",
                         ];
 
-                        const targetTexts = ["Reload", "Retry", "Got it", "Dismiss", "Not now", "Continue to the app"];
+                        const targetTexts = [
+                            "Reload",
+                            "Retry",
+                            "Got it",
+                            "Dismiss",
+                            "Not now",
+                            "Continue to the app",
+                            "Skip",
+                        ];
 
                         // Remove passive blockers
                         blockers.forEach(selector => {
@@ -1296,14 +1317,20 @@ class BrowserManager {
     }
 
     async launchBrowserForVNC(extraArgs = {}) {
+        const stickyProxy = this.stickyProxyManager.reserveProxyForNewAccount("VNC account binding");
         this.logger.info("🚀 [VNC] Launching a new, separate, headful browser instance for VNC session...");
-        if (!fs.existsSync(this.browserExecutablePath)) {
-            throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
+        const browserExecutablePath = this._getBrowserExecutablePath();
+        if (!fs.existsSync(browserExecutablePath)) {
+            throw new Error(`Browser executable not found at path: ${browserExecutablePath}`);
         }
 
-        const proxyConfig = parseProxyFromEnv();
+        const proxyConfig = stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
         if (proxyConfig) {
-            this.logger.info(`[VNC] 🌐 Using proxy: ${proxyConfig.server}`);
+            this.logger.info(
+                stickyProxy
+                    ? `[VNC] Launching browser with proxy: ${stickyProxy.display}`
+                    : `[VNC] 🌐 Using proxy: ${proxyConfig.server}`
+            );
         }
 
         // This browser instance is temporary and specific to the VNC session.
@@ -1313,7 +1340,8 @@ class BrowserManager {
                 ...process.env,
                 ...extraArgs.env,
             },
-            executablePath: this.browserExecutablePath,
+            executablePath: browserExecutablePath,
+            firefoxUserPrefs: FIREFOX_DOH_DISABLED_PREFS,
             headless: false,
             ...(proxyConfig ? { proxy: proxyConfig } : {}),
         });
@@ -1339,7 +1367,7 @@ class BrowserManager {
         this.logger.info("✅ [VNC] VNC browser context successfully created.");
 
         // Return both the browser and context so the caller can manage their lifecycle.
-        return { browser: vncBrowser, context };
+        return { browser: vncBrowser, context, stickyProxy };
     }
 
     /**
@@ -1455,15 +1483,22 @@ class BrowserManager {
     async _ensureBrowser() {
         if (this.browser) return;
 
-        const proxyConfig = parseProxyFromEnv();
+        const isStickyProxyEnabled = this.stickyProxyManager.isEnabled();
+        const proxyConfig = isStickyProxyEnabled ? null : parseProxyFromEnv();
+        if (isStickyProxyEnabled) {
+            this.logger.info(
+                "[Browser] Sticky proxy mode enabled; main browser launch will not use environment proxy."
+            );
+        }
         this.logger.info("🚀 [Browser] Launching main browser instance...");
-        if (!fs.existsSync(this.browserExecutablePath)) {
+        const browserExecutablePath = this._getBrowserExecutablePath();
+        if (!fs.existsSync(browserExecutablePath)) {
             this._currentAuthIndex = -1;
-            throw new Error(`Browser executable not found at path: ${this.browserExecutablePath}`);
+            throw new Error(`Browser executable not found at path: ${browserExecutablePath}`);
         }
         this.browser = await firefox.launch({
             args: this.launchArgs,
-            executablePath: this.browserExecutablePath,
+            executablePath: browserExecutablePath,
             firefoxUserPrefs: this.firefoxUserPrefs,
             headless: true,
             ...(proxyConfig ? { proxy: proxyConfig } : {}),
@@ -1530,6 +1565,109 @@ class BrowserManager {
                     this._backgroundPreloadTask = null;
                 }
             });
+    }
+
+    _hasActiveQueueForAuth(authIndex) {
+        if (this.connectionRegistry?.hasMessageQueueForAuth) {
+            return this.connectionRegistry.hasMessageQueueForAuth(authIndex);
+        }
+        return false;
+    }
+
+    _cancelPendingContextClosure(authIndex, reason = "closure_cancelled") {
+        if (!this.pendingContextClosures.has(authIndex)) {
+            return false;
+        }
+        this.pendingContextClosures.delete(authIndex);
+        this.logger.info(`[ContextPool] Cancelled pending close for context #${authIndex} (${reason}).`);
+        return true;
+    }
+
+    _scheduleContextClosureWhenIdle(authIndex, reason) {
+        if (!this.contexts.has(authIndex)) {
+            return false;
+        }
+        const existingReason = this.pendingContextClosures.get(authIndex);
+        if (existingReason) {
+            this.logger.debug(
+                `[ContextPool] Context #${authIndex} is already pending close (${existingReason}), active queues are still present`
+            );
+            return false;
+        }
+        this.pendingContextClosures.set(authIndex, reason);
+        this.logger.info(
+            `[ContextPool] Deferring close for busy context #${authIndex} (active queue(s) present, reason: ${reason})`
+        );
+        return false;
+    }
+
+    async _closeContextForPoolIfPossible(authIndex, reason) {
+        if (this._hasActiveQueueForAuth(authIndex)) {
+            return this._scheduleContextClosureWhenIdle(authIndex, reason);
+        }
+
+        this.pendingContextClosures.delete(authIndex);
+        await this.closeContext(authIndex);
+        return true;
+    }
+
+    async _closePendingContextIfIdle(authIndex) {
+        if (!this.pendingContextClosures.has(authIndex)) {
+            return false;
+        }
+        if (authIndex === this._currentAuthIndex) {
+            this.logger.debug(
+                `[ContextPool] Skipping pending close for context #${authIndex} because it is active again as current.`
+            );
+            return false;
+        }
+        if (!this.contexts.has(authIndex)) {
+            this.pendingContextClosures.delete(authIndex);
+            return false;
+        }
+
+        if (this._hasActiveQueueForAuth(authIndex)) {
+            this.logger.debug(
+                `[ContextPool] Pending close for context #${authIndex} is still waiting on active queue(s).`
+            );
+            return false;
+        }
+
+        const pendingReason = this.pendingContextClosures.get(authIndex);
+        this.pendingContextClosures.delete(authIndex);
+        this.logger.info(
+            `[ContextPool] Closing deferred context #${authIndex} now that all queues are drained (reason: ${pendingReason}).`
+        );
+        await this.closeContext(authIndex);
+        if (this._isSystemBusy()) {
+            this.logger.info("[ContextPool] Skipping rebalance after deferred close because system is busy.");
+            return true;
+        }
+        this.rebalanceContextPool().catch(error => {
+            this.logger.error(`[ContextPool] Rebalance after deferred close failed: ${error.message}`);
+        });
+        return true;
+    }
+
+    async _flushPendingContextClosures() {
+        for (const authIndex of [...this.pendingContextClosures.keys()]) {
+            await this._closePendingContextIfIdle(authIndex);
+        }
+    }
+
+    _prioritizeContextsForRemoval(indices) {
+        const idle = [];
+        const busy = [];
+
+        for (const authIndex of indices) {
+            if (this._hasActiveQueueForAuth(authIndex)) {
+                busy.push({ authIndex });
+            } else {
+                idle.push(authIndex);
+            }
+        }
+
+        return { busy, idle };
     }
 
     /**
@@ -1754,15 +1892,28 @@ class BrowserManager {
             }
         }
 
-        // Remove contexts according to priority until we have enough space
-        const toRemove = removalPriority.slice(0, removeCount);
+        const { busy, idle } = this._prioritizeContextsForRemoval(removalPriority);
+        const toRemoveNow = idle.slice(0, removeCount);
+        const toDefer = busy.slice(0, Math.max(0, removeCount - toRemoveNow.length));
 
         this.logger.info(
-            `[ContextPool] Pre-cleanup: removing ${toRemove.length} contexts before switch to #${targetAuthIndex}: [${toRemove}] (${this.contexts.size} ready + ${this.initializingContexts.size} initializing)`
+            `[ContextPool] Pre-cleanup before switch to #${targetAuthIndex}: immediate=[${toRemoveNow}], deferred=[${toDefer.map(
+                entry => entry.authIndex
+            )}] (${this.contexts.size} ready + ${this.initializingContexts.size} initializing)`
         );
 
-        for (const idx of toRemove) {
-            await this.closeContext(idx);
+        for (const idx of toRemoveNow) {
+            await this._closeContextForPoolIfPossible(idx, "pre_cleanup_for_switch");
+        }
+
+        for (const entry of toDefer) {
+            this._scheduleContextClosureWhenIdle(entry.authIndex, "pre_cleanup_for_switch");
+        }
+
+        if (toDefer.length > 0) {
+            this.logger.warn(
+                `[ContextPool] Allowing temporary MAX_CONTEXTS overflow while busy contexts drain before switch to #${targetAuthIndex}.`
+            );
         }
     }
 
@@ -1794,6 +1945,10 @@ class BrowserManager {
             targets = new Set(nonExpiredAvailable);
         } else {
             targets = new Set(ordered.slice(0, maxContexts));
+        }
+
+        for (const idx of targets) {
+            this._cancelPendingContextClosure(idx, "rebalance_target");
         }
 
         // Remove contexts not in targets (except current)
@@ -1835,16 +1990,25 @@ class BrowserManager {
         // If a foreground task is running, _executePreloadTask will skip it (line 1382)
         const candidates = ordered.filter(idx => !activeContexts.has(idx));
 
+        const { busy, idle } = this._prioritizeContextsForRemoval(toRemove);
+
         this.logger.info(
-            `[ContextPool] Rebalance: targets=[${[...targets]}], remove=[${toRemove}], candidates=[${candidates}]`
+            `[ContextPool] Rebalance: targets=[${[...targets]}], removeNow=[${idle}], removeDeferred=[${busy.map(
+                entry => entry.authIndex
+            )}], candidates=[${candidates}]`
         );
 
-        for (const idx of toRemove) {
-            await this.closeContext(idx);
+        for (const idx of idle) {
+            await this._closeContextForPoolIfPossible(idx, "rebalance");
         }
 
-        // Preload candidates if we have room in the pool
-        if (candidates.length > 0 && (isUnlimited || this.contexts.size < maxContexts)) {
+        for (const entry of busy) {
+            this._scheduleContextClosureWhenIdle(entry.authIndex, "rebalance");
+        }
+
+        // Preload candidates if ready and initializing contexts still leave room in the pool
+        const poolOccupancy = this.contexts.size + this.initializingContexts.size;
+        if (candidates.length > 0 && (isUnlimited || poolOccupancy < maxContexts)) {
             this._preloadBackgroundContexts(candidates, isUnlimited ? 0 : maxContexts);
         }
     }
@@ -1877,21 +2041,20 @@ class BrowserManager {
 
         try {
             // Check if this context has been marked for abort before starting
-            if (this.abortedContexts.has(authIndex)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
-            }
-
-            // Check if background preload was aborted (only for background tasks)
-            if (isBackgroundTask && this._backgroundPreloadAbort) {
-                throw new ContextAbortedError(authIndex, "background preload aborted");
-            }
+            this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             // Initialize per-context WebSocket state to ensure clean state for this context
             // Each context gets its own state object, preventing cross-contamination
             // between concurrent init/reconnect operations on different accounts
             this._wsInitState.set(authIndex, { failed: false, success: false });
 
-            const proxyConfig = parseProxyFromEnv();
+            const stickyProxy = this.stickyProxyManager.getProxyForAuth(authIndex);
+            const proxyConfig = stickyProxy ? stickyProxy.proxy : parseProxyFromEnv();
+            if (stickyProxy) {
+                this.logger.info(
+                    `[Context#${authIndex}] Using sticky proxy for account "${stickyProxy.accountKey}": ${stickyProxy.display}`
+                );
+            }
             const storageStateObject = this.authSource.getAuth(authIndex);
             if (!storageStateObject) {
                 throw new Error(`Failed to get or parse auth source for index ${authIndex}.`);
@@ -1902,9 +2065,7 @@ class BrowserManager {
             const randomHeight = 1080 + Math.floor(Math.random() * 50);
 
             // Check abort status before expensive operations
-            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
-            }
+            this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             context = await this.browser.newContext({
                 deviceScaleFactor: 1,
@@ -1914,9 +2075,7 @@ class BrowserManager {
             });
 
             // Check abort status after context creation
-            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
-            }
+            this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             // Inject Privacy Script immediately after context creation
             const privacyScript = this._getPrivacyProtectionScript(authIndex);
@@ -1991,31 +2150,16 @@ class BrowserManager {
             });
 
             // Check abort status before navigation (most time-consuming part)
-            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
-            }
+            this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             await this._navigateAndWakeUpPage(page, `[Context#${authIndex}]`);
 
             // Check abort status after navigation
-            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
-            }
+            this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             await this._checkPageStatusAndErrors(page, `[Context#${authIndex}]`, authIndex);
 
-            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
-            }
-
-            await this._handlePopups(page, `[Context#${authIndex}]`);
-
-            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
-            }
-
-            // Try to click Launch button if it exists (not a popup, but a page button)
-            await this._tryClickLaunchButton(page, `[Context#${authIndex}]`);
+            this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             // Wait for WebSocket initialization (no retry)
             // Check if initialization already succeeded (console listener may have detected it)
@@ -2039,9 +2183,7 @@ class BrowserManager {
             }
 
             // Final check before adding to contexts map
-            if (this.abortedContexts.has(authIndex) || (isBackgroundTask && this._backgroundPreloadAbort)) {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
-            }
+            this._throwIfContextInitAborted(authIndex, isBackgroundTask);
 
             // Save to contexts map - with atomic abort check to prevent race condition
             // between the check above and actually adding to the map
@@ -2052,7 +2194,7 @@ class BrowserManager {
                     page,
                 });
             } else {
-                throw new ContextAbortedError(authIndex, "marked for deletion");
+                this._throwIfContextInitAborted(authIndex, isBackgroundTask);
             }
 
             // Update auth file
@@ -2114,6 +2256,8 @@ class BrowserManager {
             this._currentAuthIndex = -1;
             throw new Error(`Invalid authIndex: ${authIndex}. Must be >= 0.`);
         }
+
+        this._cancelPendingContextClosure(authIndex, "context_reused");
 
         // [Auth Switch] Save current auth data before switching
         if (this.browser && this._currentAuthIndex >= 0 && this._currentAuthIndex !== authIndex) {
@@ -2194,6 +2338,7 @@ class BrowserManager {
 
                         // Switch to new context
                         this._activateContext(contextData.context, contextData.page, authIndex);
+                        await this._flushPendingContextClosures();
 
                         this.logger.info(`✅ [FastSwitch] Switched to account #${authIndex} instantly!`);
                         return;
@@ -2249,6 +2394,7 @@ class BrowserManager {
             const { context, page } = await this._initializeContext(authIndex, false);
 
             this._activateContext(context, page, authIndex);
+            await this._flushPendingContextClosures();
 
             // If this account was marked as expired but login succeeded, restore it
             if (this.authSource.isExpired(authIndex)) {
@@ -2363,12 +2509,6 @@ class BrowserManager {
             // Check for cookie expiration, region restrictions, and other errors
             await this._checkPageStatusAndErrors(page, "[Reconnect]", targetAuthIndex);
 
-            // Handle various popups (Cookie consent, Got it, Onboarding, etc.)
-            await this._handlePopups(page, "[Reconnect]");
-
-            // Try to click Launch button if it exists (not a popup, but a page button)
-            await this._tryClickLaunchButton(page, "[Reconnect]");
-
             // Wait for WebSocket initialization (no retry)
             // Check if initialization already succeeded (console listener may have detected it)
             const wsState = this._wsInitState.get(targetAuthIndex);
@@ -2456,6 +2596,8 @@ class BrowserManager {
      * @param {number} authIndex - The auth index to close
      */
     async closeContext(authIndex) {
+        this.pendingContextClosures.delete(authIndex);
+
         // If context is being initialized in background, signal abort and wait
         if (this.initializingContexts.has(authIndex)) {
             this.logger.info(`[Browser] Context #${authIndex} is being initialized, marking for abort and waiting...`);
@@ -2549,6 +2691,7 @@ class BrowserManager {
         this.contexts.clear();
         this.initializingContexts.clear();
         this.abortedContexts.clear();
+        this.pendingContextClosures.clear();
         this._wsInitState.clear();
         this.context = null;
         this.page = null;
