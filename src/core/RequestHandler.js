@@ -36,8 +36,6 @@ class RequestHandler {
         this.authSwitcher = new AuthSwitcher(logger, config, authSource, browserManager);
         this.formatConverter = new FormatConverter(logger, serverSystem);
 
-        this.maxRetries = this.config.maxRetries;
-        this.retryDelay = this.config.retryDelay;
         this.needsSwitchingAfterRequest = false;
 
         // Timeout settings
@@ -64,6 +62,10 @@ class RequestHandler {
         return this.authSwitcher.isSystemBusy;
     }
 
+    set isSystemBusy(value) {
+        this.authSwitcher.isSystemBusy = value === true;
+    }
+
     _getUsageStatsService() {
         return this.serverSystem.usageStatsService || null;
     }
@@ -87,8 +89,41 @@ class RequestHandler {
         return match?.[1] || null;
     }
 
+    _convertEmbedContentBodyToBatch(bodyObj, modelName) {
+        return {
+            requests: [
+                {
+                    ...bodyObj,
+                    model: `models/${modelName}`,
+                },
+            ],
+        };
+    }
+
+    _convertBatchEmbedResponseToEmbedContent(fullBodyBuffer) {
+        const batchResponse = JSON.parse(fullBodyBuffer.toString());
+        const embedding = Array.isArray(batchResponse.embeddings) ? batchResponse.embeddings[0] : null;
+
+        if (!embedding) {
+            throw new Error("Backend batchEmbedContents response did not contain embeddings[0].");
+        }
+
+        return Buffer.from(
+            JSON.stringify({
+                embedding,
+                ...(batchResponse.usageMetadata ? { usageMetadata: batchResponse.usageMetadata } : {}),
+            })
+        );
+    }
+
     _categorizeRequest(pathValue, fallback = "request") {
         if (typeof pathValue !== "string") return fallback;
+        if (
+            pathValue.includes("embedContent") ||
+            pathValue.includes("batchEmbedContents") ||
+            pathValue.includes("embeddings")
+        )
+            return "embedding";
         if (pathValue.includes("countTokens") || pathValue.includes("input_tokens")) return "count_tokens";
         if (pathValue.includes("generateContent") || pathValue.includes("streamGenerateContent")) return "generation";
         if (pathValue.includes("/upload/")) return "upload";
@@ -537,10 +572,6 @@ class RequestHandler {
     }
 
     async _waitForSystemAndConnectionIfBusy(res = null, options = {}) {
-        if (!this.authSwitcher.isSystemBusy) {
-            return true;
-        }
-
         const {
             busyMessage = "Server undergoing internal maintenance (account switching/recovery), please try again later.",
             connectionMessage = "Service temporarily unavailable: Connection not established after switching.",
@@ -568,6 +599,42 @@ class RequestHandler {
                 sendError(503, connectionMessage);
                 return false;
             }
+        }
+
+        return true;
+    }
+
+    async _ensureBrowserBackedRequestReady(res, options = {}) {
+        const { logPrefix = "Request", waitErrorType = null, waitOptions } = options;
+
+        // Check current account's browser connection
+        if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
+            this.logger.warn(`[${logPrefix}] No WebSocket connection for current account #${this.currentAuthIndex}`);
+            const recovered = await this._handleBrowserRecovery(res);
+            if (!recovered) {
+                this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: Browser recovery failed.");
+                return false;
+            }
+        }
+
+        // Wait for system to become ready if it's busy
+        const effectiveWaitOptions =
+            waitOptions === undefined && waitErrorType
+                ? {
+                      sendError: (status, message) => this._sendErrorResponse(res, status, message, waitErrorType),
+                  }
+                : waitOptions;
+        const ready =
+            effectiveWaitOptions === undefined
+                ? await this._waitForSystemAndConnectionIfBusy(res)
+                : await this._waitForSystemAndConnectionIfBusy(res, effectiveWaitOptions);
+        if (!ready) {
+            this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
+            return false;
+        }
+
+        if (this.browserManager) {
+            this.browserManager.notifyUserActivity();
         }
 
         return true;
@@ -732,6 +799,7 @@ class RequestHandler {
                 this.authSwitcher.isSystemBusy = true;
                 this.logger.info(`[System] Set isSystemBusy=true for direct recovery to account #${recoveryAuthIndex}`);
 
+                await this.browserManager.preCleanupForSwitch(recoveryAuthIndex);
                 await this.browserManager.launchOrSwitchContext(recoveryAuthIndex);
                 this.logger.info(`✅ [System] Browser successfully recovered to account #${recoveryAuthIndex}!`);
 
@@ -830,30 +898,10 @@ class RequestHandler {
         res.__proxyResponseStreamMode = null;
 
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
+            if (!(await this._ensureBrowserBackedRequestReady(res))) {
+                return;
             }
 
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
-            }
             // Handle usage-based account switching
             const isGenerativeRequest =
                 req.method === "POST" &&
@@ -933,6 +981,67 @@ class RequestHandler {
         }
     }
 
+    // Process OpenAI embeddings requests
+    async processOpenAIEmbeddingsRequest(req, res) {
+        const requestId = this._generateRequestId();
+        this._startTrackedRequest(requestId, req, {
+            apiFormat: "openai",
+            isStreaming: false,
+            requestCategory: "embedding",
+            streamMode: null,
+        });
+        this._setResponseApiFormat(res, "openai");
+        res.__proxyResponseStreamMode = null;
+
+        try {
+            if (!(await this._ensureBrowserBackedRequestReady(res, { waitErrorType: "service_unavailable" }))) {
+                return;
+            }
+
+            const { cleanModelName, googleRequest, path } = this.formatConverter.translateOpenAIEmbeddingsToGoogle(
+                req.body
+            );
+            const proxyRequest = {
+                body: JSON.stringify(googleRequest),
+                headers: req.headers,
+                is_generative: false,
+                method: "POST",
+                path,
+                query_params: req.query || {},
+                request_id: requestId,
+                streaming_mode: "fake",
+                tracking_model: cleanModelName,
+            };
+            this._initializeProxyRequestAttempt(proxyRequest);
+            this._updateTrackedRequest(requestId, {
+                isStreaming: false,
+                model: proxyRequest.tracking_model,
+                path: proxyRequest.path,
+                requestCategory: "embedding",
+                streamMode: null,
+            });
+
+            try {
+                const messageQueue = this.connectionRegistry.createMessageQueue(
+                    requestId,
+                    this.currentAuthIndex,
+                    proxyRequest.request_attempt_id
+                );
+                this._setupClientDisconnectHandler(res, requestId);
+
+                await this._handleNonStreamResponse(proxyRequest, messageQueue, req, res);
+            } catch (error) {
+                this._handleQueueTimeout(error, requestId);
+                this._handleRequestError(error, res, requestId);
+            } finally {
+                this.connectionRegistry.removeMessageQueue(requestId, "request_complete");
+                if (!res.writableEnded) res.end();
+            }
+        } finally {
+            this._finalizeTrackedRequest(requestId, res);
+        }
+    }
+
     // Process File Upload requests
     async processUploadRequest(req, res) {
         const requestId = this._generateRequestId();
@@ -946,34 +1055,13 @@ class RequestHandler {
         this._setResponseApiFormat(res, "upload");
 
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Upload] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
+            if (!(await this._ensureBrowserBackedRequestReady(res, { logPrefix: "Upload" }))) {
+                return;
             }
 
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res);
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
-            }
-
+            const uploadBodyBuffer = this._patchUploadStartMetadata(req);
             const proxyRequest = {
-                body_b64: req.rawBody ? req.rawBody.toString("base64") : undefined,
+                body_b64: uploadBodyBuffer ? uploadBodyBuffer.toString("base64") : undefined,
                 headers: req.headers,
                 is_generative: false, // Uploads are never generative
                 method: req.method,
@@ -1008,6 +1096,40 @@ class RequestHandler {
         }
     }
 
+    _patchUploadStartMetadata(req) {
+        const originalBody = req.rawBody;
+
+        if (!this._isUploadStartRequest(req)) return originalBody;
+
+        const uploadContentType = req.headers["x-goog-upload-header-content-type"];
+        if (!uploadContentType || !originalBody?.length) return originalBody;
+
+        let bodyObj;
+        try {
+            bodyObj = JSON.parse(originalBody.toString());
+        } catch (e) {
+            this.logger.debug(`[Upload] Start metadata is not valid JSON, skipping mimeType patch: ${e.message}`);
+            return originalBody;
+        }
+
+        if (!bodyObj || typeof bodyObj !== "object") return originalBody;
+
+        const fileMetadata = bodyObj.file || bodyObj.file_metadata || bodyObj;
+        if (!fileMetadata || typeof fileMetadata !== "object") return originalBody;
+
+        if (fileMetadata.mimeType || fileMetadata.mime_type) {
+            return originalBody;
+        }
+
+        fileMetadata.mimeType = uploadContentType;
+        return Buffer.from(JSON.stringify(bodyObj));
+    }
+
+    _isUploadStartRequest(req) {
+        const command = String(req.headers["x-goog-upload-command"] || "").toLowerCase();
+        return req.method === "POST" && req.path.includes("/upload/") && command.includes("start");
+    }
+
     // Process OpenAI format requests
     async processOpenAIRequest(req, res) {
         const requestId = this._generateRequestId();
@@ -1015,42 +1137,18 @@ class RequestHandler {
             apiFormat: "openai",
             isStreaming: req.body.stream === true,
             requestCategory: "generation",
-            streamMode: req.body.stream === true ? this.serverSystem.streamingMode : null,
+            streamMode: req.body.stream === true ? this.config.streamingMode : null,
         });
         this._setResponseApiFormat(res, "openai");
         res.__proxyResponseStreamMode = null;
 
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res, {
-                    sendError: (status, message) =>
-                        this._sendErrorResponse(res, status, message, "service_unavailable"),
-                });
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
+            if (!(await this._ensureBrowserBackedRequestReady(res, { waitErrorType: "service_unavailable" }))) {
+                return;
             }
 
             const isOpenAIStream = req.body.stream === true;
-            const systemStreamMode = this.serverSystem.streamingMode;
+            const systemStreamMode = this.config.streamingMode;
 
             // Handle usage counting
             const usageCount = this.authSwitcher.incrementUsageCount();
@@ -1122,10 +1220,10 @@ class RequestHandler {
                     while (true) {
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
-                            this.currentAuthIndex,
-                            this._getAccountNameForIndex(this.currentAuthIndex)
+                            currentQueueAuthIndex,
+                            this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest);
+                        this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
@@ -1387,38 +1485,14 @@ class RequestHandler {
             apiFormat: "response_api",
             isStreaming: req.body.stream === true,
             requestCategory: "generation",
-            streamMode: req.body.stream === true ? this.serverSystem.streamingMode : null,
+            streamMode: req.body.stream === true ? this.config.streamingMode : null,
         });
         this._setResponseApiFormat(res, "response_api");
         res.__proxyResponseStreamMode = null;
 
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res, {
-                    sendError: (status, message) =>
-                        this._sendErrorResponse(res, status, message, "service_unavailable"),
-                });
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
+            if (!(await this._ensureBrowserBackedRequestReady(res, { waitErrorType: "service_unavailable" }))) {
+                return;
             }
 
             const isOpenAIStream = req.body.stream === true;
@@ -1471,7 +1545,7 @@ class RequestHandler {
             const responseDefaults = Object.fromEntries(
                 Object.entries(responseDefaultsRaw).filter(([, v]) => v !== undefined)
             );
-            const systemStreamMode = this.serverSystem.streamingMode;
+            const systemStreamMode = this.config.streamingMode;
 
             // Handle usage counting
             const usageCount = this.authSwitcher.incrementUsageCount();
@@ -1549,10 +1623,10 @@ class RequestHandler {
                     while (true) {
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
-                            this.currentAuthIndex,
-                            this._getAccountNameForIndex(this.currentAuthIndex)
+                            currentQueueAuthIndex,
+                            this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest);
+                        this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
@@ -1837,42 +1911,18 @@ class RequestHandler {
             apiFormat: "claude",
             isStreaming: req.body.stream === true,
             requestCategory: "generation",
-            streamMode: req.body.stream === true ? this.serverSystem.streamingMode : null,
+            streamMode: req.body.stream === true ? this.config.streamingMode : null,
         });
         this._setResponseApiFormat(res, "claude");
         res.__proxyResponseStreamMode = null;
 
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res, {
-                    sendError: (status, message) => this._sendErrorResponse(res, status, message, "overloaded_error"),
-                });
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
+            if (!(await this._ensureBrowserBackedRequestReady(res, { waitErrorType: "overloaded_error" }))) {
+                return;
             }
 
             const isClaudeStream = req.body.stream === true;
-            const systemStreamMode = this.serverSystem.streamingMode;
+            const systemStreamMode = this.config.streamingMode;
 
             // Handle usage counting
             const usageCount = this.authSwitcher.incrementUsageCount();
@@ -1945,10 +1995,10 @@ class RequestHandler {
                     while (true) {
                         this._getUsageStatsService()?.recordAttempt(
                             proxyRequest.request_id,
-                            this.currentAuthIndex,
-                            this._getAccountNameForIndex(this.currentAuthIndex)
+                            currentQueueAuthIndex,
+                            this._getAccountNameForIndex(currentQueueAuthIndex)
                         );
-                        this._forwardRequest(proxyRequest);
+                        this._forwardRequest(proxyRequest, currentQueueAuthIndex);
                         initialMessage = await currentQueue.dequeue();
 
                         const initialStatus = Number(initialMessage?.status);
@@ -2205,32 +2255,8 @@ class RequestHandler {
         this._setResponseApiFormat(res, "claude");
 
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res, {
-                    sendError: (status, message) => this._sendErrorResponse(res, status, message, "overloaded_error"),
-                });
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
+            if (!(await this._ensureBrowserBackedRequestReady(res, { waitErrorType: "overloaded_error" }))) {
+                return;
             }
 
             // Translate Claude format to Google format
@@ -2280,14 +2306,16 @@ class RequestHandler {
                     this.currentAuthIndex,
                     proxyRequest.request_attempt_id
                 );
+                const messageQueueAuthIndex =
+                    this.connectionRegistry.getAuthIndexForRequest(requestId) ?? this.currentAuthIndex;
                 this._setupClientDisconnectHandler(res, requestId);
 
                 this._getUsageStatsService()?.recordAttempt(
                     requestId,
-                    this.currentAuthIndex,
-                    this._getAccountNameForIndex(this.currentAuthIndex)
+                    messageQueueAuthIndex,
+                    this._getAccountNameForIndex(messageQueueAuthIndex)
                 );
-                this._forwardRequest(proxyRequest);
+                this._forwardRequest(proxyRequest, messageQueueAuthIndex);
                 const response = await messageQueue.dequeue();
 
                 if (response.event_type === "error") {
@@ -2365,33 +2393,8 @@ class RequestHandler {
         this._setResponseApiFormat(res, "response_api");
 
         try {
-            // Check current account's browser connection
-            if (!this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex)) {
-                this.logger.warn(`[Request] No WebSocket connection for current account #${this.currentAuthIndex}`);
-                const recovered = await this._handleBrowserRecovery(res);
-                if (!recovered) {
-                    this._markTrackedEarlyExitIfNeeded(
-                        res,
-                        "Service temporarily unavailable: Browser recovery failed."
-                    );
-                    return;
-                }
-            }
-
-            // Wait for system to become ready if it's busy
-            {
-                const ready = await this._waitForSystemAndConnectionIfBusy(res, {
-                    sendError: (status, message) =>
-                        this._sendErrorResponse(res, status, message, "service_unavailable"),
-                });
-                if (!ready) {
-                    this._markTrackedEarlyExitIfNeeded(res, "Service temporarily unavailable: System not ready.");
-                    return;
-                }
-            }
-
-            if (this.browserManager) {
-                this.browserManager.notifyUserActivity();
+            if (!(await this._ensureBrowserBackedRequestReady(res, { waitErrorType: "service_unavailable" }))) {
+                return;
             }
 
             // Translate OpenAI Response format to Google format (so we can use Gemini countTokens)
@@ -2444,14 +2447,16 @@ class RequestHandler {
                     this.currentAuthIndex,
                     proxyRequest.request_attempt_id
                 );
+                const messageQueueAuthIndex =
+                    this.connectionRegistry.getAuthIndexForRequest(requestId) ?? this.currentAuthIndex;
                 this._setupClientDisconnectHandler(res, requestId);
 
                 this._getUsageStatsService()?.recordAttempt(
                     requestId,
-                    this.currentAuthIndex,
-                    this._getAccountNameForIndex(this.currentAuthIndex)
+                    messageQueueAuthIndex,
+                    this._getAccountNameForIndex(messageQueueAuthIndex)
                 );
-                this._forwardRequest(proxyRequest);
+                this._forwardRequest(proxyRequest, messageQueueAuthIndex);
                 const response = await messageQueue.dequeue();
 
                 if (response.event_type === "error") {
@@ -2938,10 +2943,10 @@ class RequestHandler {
             // Record attempt before forwarding, so failed attempts are also counted
             this._getUsageStatsService()?.recordAttempt(
                 proxyRequest.request_id,
-                this.currentAuthIndex,
-                this._getAccountNameForIndex(this.currentAuthIndex)
+                currentQueueAuthIndex,
+                this._getAccountNameForIndex(currentQueueAuthIndex)
             );
-            this._forwardRequest(proxyRequest);
+            this._forwardRequest(proxyRequest, currentQueueAuthIndex);
             headerMessage = await currentQueue.dequeue();
 
             const headerStatus = Number(headerMessage?.status);
@@ -3153,12 +3158,23 @@ class RequestHandler {
             }
 
             const fullBodyBuffer = Buffer.concat(chunks);
+            let responseBodyBuffer = fullBodyBuffer;
 
             try {
-                const fullResponse = JSON.parse(fullBodyBuffer.toString());
+                const fullResponse = JSON.parse(responseBodyBuffer.toString());
                 this._logGeminiNativeResponseDebug(fullResponse, "non-stream");
             } catch (e) {
                 // Ignore JSON parsing errors for finish reason
+            }
+
+            if (proxyRequest.response_transform === "batchEmbedToEmbedContent") {
+                try {
+                    responseBodyBuffer = this._convertBatchEmbedResponseToEmbedContent(responseBodyBuffer);
+                } catch (error) {
+                    this.logger.error(`❌ [Proxy] Failed to convert embedding response: ${error.message}`);
+                    this._sendErrorResponse(res, 500, "Failed to convert backend embedding response");
+                    return;
+                }
             }
 
             this._setResponseHeaders(res, headerMessage, req);
@@ -3168,7 +3184,7 @@ class RequestHandler {
                 res.type("application/json");
             }
 
-            res.send(fullBodyBuffer);
+            res.send(responseBodyBuffer);
             this.logger.info(
                 `✅ [Request] Response completed (Gemini non-stream), request ID: ${proxyRequest.request_id}`
             );
@@ -3217,21 +3233,25 @@ class RequestHandler {
     async _executeRequestWithRetries(proxyRequest, messageQueue) {
         let lastError = null;
         let currentQueue = messageQueue;
-        // Track the authIndex for the current queue to ensure proper cleanup
-        let currentQueueAuthIndex = this.currentAuthIndex;
+        const registeredQueueAuthIndex = this.connectionRegistry.getAuthIndexForRequest(proxyRequest.request_id);
+        // Track the authIndex registered for the current queue, which may differ from the global current account.
+        let currentQueueAuthIndex =
+            Number.isInteger(registeredQueueAuthIndex) && registeredQueueAuthIndex >= 0
+                ? registeredQueueAuthIndex
+                : this.currentAuthIndex;
         let retryAttempt = 1;
         const immediateSwitchTracker = this._createImmediateSwitchTracker(currentQueueAuthIndex);
 
-        while (retryAttempt <= this.maxRetries) {
+        while (retryAttempt <= this.config.maxRetries) {
             // Record attempt at the start of each retry, before forwarding.
             // This ensures failed attempts (e.g. 429 before any response) are also counted.
             this._getUsageStatsService()?.recordAttempt(
                 proxyRequest.request_id,
-                this.currentAuthIndex,
-                this._getAccountNameForIndex(this.currentAuthIndex)
+                currentQueueAuthIndex,
+                this._getAccountNameForIndex(currentQueueAuthIndex)
             );
             try {
-                this._forwardRequest(proxyRequest);
+                this._forwardRequest(proxyRequest, currentQueueAuthIndex);
 
                 const initialMessage = await currentQueue.dequeue(this.timeouts.FAKE_STREAM);
 
@@ -3271,10 +3291,61 @@ class RequestHandler {
                     // Check the actual closure reason to provide accurate error messages
                     const reason = error.reason || "unknown";
                     const isClientDisconnect = reason === "client_disconnect";
+                    const currentAuthIndex = this.currentAuthIndex;
+                    const isClosedAccountRetryable = reason === "context_closed" || reason === "page_closed";
+                    const canRetryOnCurrentAccountCandidate =
+                        !isClientDisconnect &&
+                        isClosedAccountRetryable &&
+                        retryAttempt < this.config.maxRetries &&
+                        Number.isInteger(currentQueueAuthIndex) &&
+                        currentQueueAuthIndex >= 0 &&
+                        Number.isInteger(currentAuthIndex) &&
+                        currentAuthIndex >= 0 &&
+                        currentQueueAuthIndex !== currentAuthIndex;
+
+                    if (canRetryOnCurrentAccountCandidate) {
+                        const ready = await this._waitForSystemAndConnectionIfBusy(null, {
+                            connectionMessage: "Service temporarily unavailable: Connection not ready before retry.",
+                        });
+                        if (!ready) {
+                            lastError = {
+                                message: `WebSocket connection not ready before retry on account #${this.currentAuthIndex}.`,
+                                status: 503,
+                            };
+                            break;
+                        }
+                    }
+
+                    const canRetryOnCurrentAccount =
+                        canRetryOnCurrentAccountCandidate &&
+                        Boolean(this.connectionRegistry.getConnectionByAuth(currentAuthIndex, false));
 
                     if (isClientDisconnect) {
                         this.logger.warn(`[Request] Message queue closed due to client disconnect, aborting retries.`);
                         lastError = { message: "Connection lost (client disconnect)", status: 503 };
+                    } else if (canRetryOnCurrentAccount) {
+                        this.logger.warn(
+                            `[Request] Message queue for non-current account #${currentQueueAuthIndex} closed ` +
+                                `(reason: ${reason}); retrying request #${proxyRequest.request_id} on current account #${currentAuthIndex}.`
+                        );
+                        lastError = {
+                            message: `Queue closed: ${error.message || reason}`,
+                            reason,
+                            status: 503,
+                        };
+                        this._advanceProxyRequestAttempt(proxyRequest);
+                        currentQueue = this.connectionRegistry.createMessageQueue(
+                            proxyRequest.request_id,
+                            currentAuthIndex,
+                            proxyRequest.request_attempt_id
+                        );
+                        currentQueueAuthIndex = currentAuthIndex;
+                        if (Number.isInteger(currentQueueAuthIndex) && currentQueueAuthIndex >= 0) {
+                            immediateSwitchTracker.attemptedAuthIndices.add(currentQueueAuthIndex);
+                        }
+                        await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
+                        retryAttempt++;
+                        continue;
                     } else {
                         // Queue closed for other reasons (account_switch, system_reset, etc.)
                         this.logger.warn(`[Request] Message queue closed (reason: ${reason}), aborting retries.`);
@@ -3290,8 +3361,19 @@ class RequestHandler {
                 lastError = errorPayload;
                 this._cancelCurrentAttemptBeforeRetry(proxyRequest, currentQueueAuthIndex);
 
-                // Check if we should stop retrying immediately based on status code
                 const errorStatus = Number(errorPayload?.status);
+                const isNonRetryableEmbeddingClientError =
+                    (errorStatus === 400 || errorStatus === 404) &&
+                    this._categorizeRequest(proxyRequest?.path, "request") === "embedding";
+                if (isNonRetryableEmbeddingClientError) {
+                    lastError = { ...errorPayload, skipAccountSwitch: true };
+                    this.logger.warn(
+                        `[Request] Embedding request failed with non-retryable status ${errorPayload.status}; skipping retries and account switching.`
+                    );
+                    break;
+                }
+
+                // Check if we should stop retrying immediately based on status code
                 if (
                     Number.isFinite(errorStatus) &&
                     this.config?.immediateSwitchStatusCodes?.includes(errorStatus) &&
@@ -3338,13 +3420,13 @@ class RequestHandler {
 
                 // Log the warning for the current attempt
                 this.logger.warn(
-                    `[Request] Attempt #${retryAttempt}/${this.maxRetries} for request #${proxyRequest.request_id} failed: ${errorPayload.message}`
+                    `[Request] Attempt #${retryAttempt}/${this.config.maxRetries} for request #${proxyRequest.request_id} failed: ${errorPayload.message}`
                 );
 
                 // If it's the last attempt, break the loop to return failure
-                if (retryAttempt >= this.maxRetries) {
+                if (retryAttempt >= this.config.maxRetries) {
                     this.logger.error(
-                        `❌ [Request] All ${this.maxRetries} retries failed for request #${proxyRequest.request_id}. Final error: ${errorPayload.message}`
+                        `❌ [Request] All ${this.config.maxRetries} retries failed for request #${proxyRequest.request_id}. Final error: ${errorPayload.message}`
                     );
                     break;
                 }
@@ -3376,7 +3458,18 @@ class RequestHandler {
                 }
 
                 // Wait before the next retry
-                await new Promise(resolve => setTimeout(resolve, this.retryDelay));
+                await new Promise(resolve => setTimeout(resolve, this.config.retryDelay));
+                if (
+                    !(await this._waitForSystemAndConnectionIfBusy(null, {
+                        connectionMessage: "Service temporarily unavailable: Connection not ready before retry.",
+                    }))
+                ) {
+                    lastError = {
+                        message: `WebSocket connection not ready before retry on account #${this.currentAuthIndex}.`,
+                        status: 503,
+                    };
+                    break;
+                }
                 retryAttempt++;
             }
         }
@@ -3640,7 +3733,7 @@ class RequestHandler {
             if (lowerName === "content-length") return;
 
             // Special handling for upload URL and redirects: point them back to this proxy
-            if ((lowerName === "x-goog-upload-url" || lowerName === "location") && value.includes("googleapis.com")) {
+            if (lowerName === "x-goog-upload-url" && value.includes("googleapis.com")) {
                 try {
                     const urlObj = new URL(value);
                     // Rewrite upload/redirect URLs to point to this proxy server
@@ -3650,9 +3743,8 @@ class RequestHandler {
                     if (req && req.headers && req.headers.host) {
                         newAuthority = req.headers.host;
                     } else {
-                        const host =
-                            this.serverSystem.config.host === "0.0.0.0" ? "127.0.0.1" : this.serverSystem.config.host;
-                        newAuthority = `${host}:${this.serverSystem.config.httpPort}`;
+                        const host = this.config.host === "0.0.0.0" ? "127.0.0.1" : this.config.host;
+                        newAuthority = `${host}:${this.config.httpPort}`;
                     }
 
                     const protocol =
@@ -4047,6 +4139,8 @@ class RequestHandler {
         const fullPath = req.path;
         let cleanPath = fullPath.replace(/^\/proxy/, "");
         const bodyObj = req.body;
+        let requestBodyObj = bodyObj;
+        let responseTransform = null;
 
         this.logger.debug(`[Proxy] Debug: incoming Gemini Body (Google Native) = ${JSON.stringify(bodyObj, null, 2)}`);
 
@@ -4057,6 +4151,7 @@ class RequestHandler {
         );
         let modelThinkingLevel = null;
         let modelStreamingMode = null;
+        let modelForceCodeExecution = false;
         let modelForceWebSearch = false;
 
         if (modelPathMatch) {
@@ -4064,25 +4159,32 @@ class RequestHandler {
             const rawModelName = modelPathMatch[2];
             const pathSuffix = modelPathMatch[3];
 
-            const { cleanModelName: searchStrippedModel, forceWebSearch: parsedForceWebSearch } =
-                FormatConverter.parseModelWebSearchSuffix(rawModelName);
+            const {
+                cleanModelName: toolStrippedModel,
+                forceCodeExecution: parsedForceCodeExecution,
+                forceWebSearch: parsedForceWebSearch,
+            } = FormatConverter.parseModelBuiltInToolSuffixes(rawModelName);
             const { cleanModelName: streamStrippedModel, streamingMode: parsedStreamingMode } =
-                FormatConverter.parseModelStreamingModeSuffix(searchStrippedModel);
+                FormatConverter.parseModelStreamingModeSuffix(toolStrippedModel);
             const { cleanModelName, thinkingLevel: parsedThinkingLevel } =
                 FormatConverter.parseModelThinkingLevel(streamStrippedModel);
+            modelForceCodeExecution = parsedForceCodeExecution;
             modelForceWebSearch = parsedForceWebSearch;
             modelStreamingMode = parsedStreamingMode;
             modelThinkingLevel = parsedThinkingLevel;
 
-            if (modelForceWebSearch) {
+            const modelForceToolFlags = [];
+            if (modelForceWebSearch) modelForceToolFlags.push("forceWebSearch=true");
+            if (modelForceCodeExecution) modelForceToolFlags.push("forceCodeExecution=true");
+            if (modelForceToolFlags.length > 0) {
                 this.logger.info(
-                    `[Proxy] Detected webSearch suffix in model path: "${rawModelName}" -> model="${searchStrippedModel}", forceWebSearch=true`
+                    `[Proxy] Detected built-in tool suffixes in model path: "${rawModelName}" -> model="${toolStrippedModel}", ${modelForceToolFlags.join(", ")}`
                 );
             }
 
             if (modelStreamingMode) {
                 this.logger.info(
-                    `[Proxy] Detected streamingMode suffix in model path: "${searchStrippedModel}" -> model="${streamStrippedModel}", streamingMode="${modelStreamingMode}"`
+                    `[Proxy] Detected streamingMode suffix in model path: "${toolStrippedModel}" -> model="${streamStrippedModel}", streamingMode="${modelStreamingMode}"`
                 );
             }
 
@@ -4099,7 +4201,7 @@ class RequestHandler {
         }
 
         // Force thinking for native Google requests (processed first)
-        if (this.serverSystem.forceThinking && req.method === "POST" && bodyObj && bodyObj.contents) {
+        if (this.config.forceThinking && req.method === "POST" && bodyObj && bodyObj.contents) {
             if (!bodyObj.generationConfig) {
                 bodyObj.generationConfig = {};
             }
@@ -4142,9 +4244,22 @@ class RequestHandler {
             }
         }
 
-        // Force web search and URL context for native Google requests
+        const embedContentMatch = cleanPath.match(/^\/v1beta\/models\/([^:]+):embedContent$/);
+        if (req.method === "POST" && embedContentMatch) {
+            const modelName = embedContentMatch[1];
+            cleanPath = `/v1beta/models/${modelName}:batchEmbedContents`;
+            requestBodyObj = this._convertEmbedContentBodyToBatch(bodyObj, modelName);
+            responseTransform = "batchEmbedToEmbedContent";
+            this.logger.info(`[Proxy] Rewriting embedContent to batchEmbedContents for model "${modelName}".`);
+        }
+
+        // Force built-in tools for native Google requests
         if (
-            (this.serverSystem.forceWebSearch || modelForceWebSearch || this.serverSystem.forceUrlContext) &&
+            (this.config.forceWebSearch ||
+                modelForceWebSearch ||
+                this.config.forceUrlContext ||
+                this.config.forceCodeExecution ||
+                modelForceCodeExecution) &&
             req.method === "POST" &&
             bodyObj &&
             bodyObj.contents
@@ -4156,7 +4271,7 @@ class RequestHandler {
             const toolsToAdd = [];
 
             // Handle Google Search
-            if (this.serverSystem.forceWebSearch || modelForceWebSearch) {
+            if (this.config.forceWebSearch || modelForceWebSearch) {
                 const hasSearch = FormatConverter.hasGeminiGoogleSearchTool(bodyObj.tools);
                 if (!hasSearch) {
                     bodyObj.tools.push({ googleSearch: {} });
@@ -4169,7 +4284,7 @@ class RequestHandler {
             }
 
             // Handle URL Context
-            if (this.serverSystem.forceUrlContext) {
+            if (this.config.forceUrlContext) {
                 const hasUrlContext = FormatConverter.hasGeminiUrlContextTool(bodyObj.tools);
                 if (!hasUrlContext) {
                     bodyObj.tools.push({ urlContext: {} });
@@ -4177,6 +4292,19 @@ class RequestHandler {
                 } else {
                     this.logger.info(
                         `[Proxy] ✅ Client-provided URL context detected, skipping force injection. (Google Native)`
+                    );
+                }
+            }
+
+            // Handle Code Execution
+            if (this.config.forceCodeExecution || modelForceCodeExecution) {
+                const hasCodeExecution = FormatConverter.hasGeminiCodeExecutionTool(bodyObj.tools);
+                if (!hasCodeExecution) {
+                    bodyObj.tools.push({ codeExecution: {} });
+                    toolsToAdd.push("codeExecution");
+                } else {
+                    this.logger.info(
+                        `[Proxy] ✅ Client-provided code execution detected, skipping force injection. (Google Native)`
                     );
                 }
             }
@@ -4195,10 +4323,12 @@ class RequestHandler {
             bodyObj.safetySettings = this.formatConverter.getDefaultSafetySettings();
         }
 
-        this.logger.debug(`[Proxy] Debug: Final Gemini Request (Google Native) = ${JSON.stringify(bodyObj, null, 2)}`);
+        this.logger.debug(
+            `[Proxy] Debug: Final Gemini Request (Google Native) = ${JSON.stringify(requestBodyObj, null, 2)}`
+        );
 
         return {
-            body: req.method !== "GET" ? JSON.stringify(bodyObj) : undefined,
+            body: req.method !== "GET" ? JSON.stringify(requestBodyObj) : undefined,
             headers: req.headers,
             is_generative:
                 req.method === "POST" &&
@@ -4207,7 +4337,8 @@ class RequestHandler {
             path: cleanPath,
             query_params: req.query || {},
             request_id: requestId,
-            streaming_mode: modelStreamingMode || this.serverSystem.streamingMode,
+            response_transform: responseTransform,
+            streaming_mode: modelStreamingMode || this.config.streamingMode,
         };
     }
 
@@ -4229,11 +4360,11 @@ class RequestHandler {
         );
     }
 
-    _forwardRequest(proxyRequest) {
-        const connection = this.connectionRegistry.getConnectionByAuth(this.currentAuthIndex);
+    _forwardRequest(proxyRequest, authIndex = this.currentAuthIndex) {
+        const connection = this.connectionRegistry.getConnectionByAuth(authIndex);
         if (connection) {
             this.logger.debug(
-                `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${this.currentAuthIndex}` +
+                `[Request] Forwarding request #${proxyRequest.request_id} via connection for authIndex=${authIndex}` +
                     ` (attempt=${proxyRequest.request_attempt_id})`
             );
             connection.send(
@@ -4243,9 +4374,7 @@ class RequestHandler {
                 })
             );
         } else {
-            throw new Error(
-                `Unable to forward request: No WebSocket connection found for authIndex=${this.currentAuthIndex}`
-            );
+            throw new Error(`Unable to forward request: No WebSocket connection found for authIndex=${authIndex}`);
         }
     }
 
