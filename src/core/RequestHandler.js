@@ -998,17 +998,31 @@ class RequestHandler {
                 return;
             }
 
-            const { cleanModelName, googleRequest, path } = this.formatConverter.translateOpenAIEmbeddingsToGoogle(
-                req.body
-            );
+            let cleanModelName, encodingFormat, googleRequest, path;
+            try {
+                const result = this.formatConverter.translateOpenAIEmbeddingsToGoogle(req.body);
+                cleanModelName = result.cleanModelName;
+                encodingFormat = result.encodingFormat;
+                googleRequest = result.googleRequest;
+                path = result.path;
+            } catch (error) {
+                this.logger.error(
+                    `❌ [Adapter] OpenAI embeddings request translation failed: ${error.message}, request ID: ${requestId}`
+                );
+                return this._sendErrorResponse(res, 400, error.message, "invalid_request_error");
+            }
+
             const proxyRequest = {
                 body: JSON.stringify(googleRequest),
-                headers: req.headers,
+                headers: { "Content-Type": "application/json" },
                 is_generative: false,
                 method: "POST",
                 path,
-                query_params: req.query || {},
+                query_params: {},
                 request_id: requestId,
+                response_encoding_format: encodingFormat,
+                response_model: cleanModelName,
+                response_transform: "batchEmbedToOpenAI",
                 streaming_mode: "fake",
                 tracking_model: cleanModelName,
             };
@@ -3172,6 +3186,18 @@ class RequestHandler {
                     responseBodyBuffer = this._convertBatchEmbedResponseToEmbedContent(responseBodyBuffer);
                 } catch (error) {
                     this.logger.error(`❌ [Proxy] Failed to convert embedding response: ${error.message}`);
+                    this._sendErrorResponse(res, 500, "Failed to convert backend embedding response");
+                    return;
+                }
+            } else if (proxyRequest.response_transform === "batchEmbedToOpenAI") {
+                try {
+                    responseBodyBuffer = this.formatConverter.translateGoogleEmbeddingsToOpenAI(
+                        responseBodyBuffer,
+                        proxyRequest.response_model,
+                        proxyRequest.response_encoding_format
+                    );
+                } catch (error) {
+                    this.logger.error(`❌ [Proxy] Failed to convert OpenAI embedding response: ${error.message}`);
                     this._sendErrorResponse(res, 500, "Failed to convert backend embedding response");
                     return;
                 }
