@@ -212,9 +212,9 @@ services:
 - `GET /v1beta/models`: 列出可用的 Gemini 模型。
 - `POST /v1beta/models/{model_name}:generateContent`: 生成内容、图片和语音。
 - `POST /v1beta/models/{model_name}:streamGenerateContent`: 流式生成内容、图片和语音，支持真流式和假流式。
+- `POST /v1beta/models/{model_name}:countTokens`: 计算请求内容的 token 数量。
 - `POST /v1beta/models/{model_name}:embedContent`: 生成单条文本嵌入向量。
 - `POST /v1beta/models/{model_name}:batchEmbedContents`: 批量生成文本嵌入向量。
-- `POST /v1beta/models/{model_name}:predict`: Imagen 系列模型图像生成。
 
 ### 👤 Anthropic 兼容 API
 
@@ -361,10 +361,10 @@ NO_PROXY=internal.example.com,10.0.0.0/8
 
 ## Star History
 
-<a href="https://star-history.dera.page/#iBUHub/AIStudioToAPI">
+<a href="https://www.star-history.com/?repos=ibuhub%2Faistudiotoapi&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
-   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=iBUHub/AIStudioToAPI" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ibuhub/aistudiotoapi&type=date&legend=top-left" />
  </picture>
 </a>

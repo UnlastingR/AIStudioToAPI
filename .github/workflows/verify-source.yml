@@ -1,0 +1,85 @@
+name: Verify Source and Build UI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Resolve validation dependencies without browser automation packages
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const pkg = require('./package.json');
+          const dir = path.join(process.env.RUNNER_TEMP, 'aistudio-validation-deps');
+          const dependencies = Object.fromEntries(
+            Object.entries({ ...pkg.dependencies, ...pkg.devDependencies })
+              .filter(([name]) => !/playwright|chromium/i.test(name))
+          );
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ private: true, dependencies }));
+          NODE
+          npm install --prefix "$RUNNER_TEMP/aistudio-validation-deps" --package-lock-only --ignore-scripts --no-audit --no-fund
+          node <<'NODE'
+          const path = require('node:path');
+          const lock = require(path.join(process.env.RUNNER_TEMP, 'aistudio-validation-deps/package-lock.json'));
+          const forbidden = Object.keys(lock.packages).filter(name => /playwright|chromium/i.test(name));
+          if (forbidden.length) throw new Error('Forbidden browser dependencies: ' + forbidden.join(', '));
+          NODE
+          npm ci --prefix "$RUNNER_TEMP/aistudio-validation-deps" --ignore-scripts --no-audit --no-fund
+          ln -s "$RUNNER_TEMP/aistudio-validation-deps/node_modules" node_modules
+
+      - name: Check backend syntax and embeddings regression tests
+        run: |
+          find src scripts tests -type f -name '*.js' -print0 | xargs -0 -n 1 node --check
+          node --check main.js
+          node --test tests/*.test.js
+
+      - name: Build frontend
+        run: npm run build:ui
+
+      - name: Package source and frontend artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/aistudio-release" artifacts
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/aistudio-release"
+          cp -a ui/dist "$RUNNER_TEMP/aistudio-release/ui/"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const metadata = {
+            revision: process.env.GITHUB_SHA,
+            version: require('./package.json').version,
+            workflowRun: process.env.GITHUB_RUN_ID,
+            artifactKind: 'source-and-ui',
+            runtimeDependenciesIncluded: false,
+            activationBlockedBy: 'Playwright is required at runtime and forbidden by environment policy'
+          };
+          const content = JSON.stringify(metadata, null, 2) + '\n';
+          fs.writeFileSync('artifacts/release-metadata.json', content);
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'aistudio-release/release-metadata.json'), content);
+          NODE
+          tar -czf artifacts/aistudio-source-ui.tar.gz -C "$RUNNER_TEMP/aistudio-release" .
+          cd artifacts
+          sha256sum aistudio-source-ui.tar.gz > SHA256SUMS
+
+      - name: Upload verified artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aistudio-source-ui-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
