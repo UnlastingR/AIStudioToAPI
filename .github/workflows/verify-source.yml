@@ -28,7 +28,7 @@ jobs:
           const dir = path.join(process.env.RUNNER_TEMP, 'aistudio-validation-deps');
           const dependencies = Object.fromEntries(
             Object.entries({ ...pkg.dependencies, ...pkg.devDependencies })
-              .filter(([name]) => !/playwright|chromium/i.test(name))
+              .filter(([name]) => !/^(@playwright\/|playwright($|-)|chromium($|-)|@sparticuz\/chromium($|-))/i.test(name))
           );
           fs.mkdirSync(dir, { recursive: true });
           fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ private: true, dependencies }));
@@ -37,7 +37,9 @@ jobs:
           node <<'NODE'
           const path = require('node:path');
           const lock = require(path.join(process.env.RUNNER_TEMP, 'aistudio-validation-deps/package-lock.json'));
-          const forbidden = Object.keys(lock.packages).filter(name => /playwright|chromium/i.test(name));
+          const forbidden = Object.keys(lock.packages).filter(key =>
+            /^(@playwright\/|playwright($|-)|chromium($|-)|@sparticuz\/chromium($|-))/i.test(key.split('node_modules/').pop())
+          );
           if (forbidden.length) throw new Error('Forbidden browser dependencies: ' + forbidden.join(', '));
           NODE
           npm ci --prefix "$RUNNER_TEMP/aistudio-validation-deps" --ignore-scripts --no-audit --no-fund
