@@ -1,6 +1,7 @@
 name: Publish Docker Image
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - fork-release
@@ -14,9 +15,16 @@ env:
   IMAGE_NAME: ghcr.io/unlastingr/aistudio-to-api
 
 jobs:
+  verify:
+    uses: ./.github/workflows/verify-source.yml
+    permissions:
+      contents: read
+
   build:
+    needs: verify
     if: github.actor == github.repository_owner
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -27,6 +35,22 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Build runtime image for validation
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: aistudio-validation:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          build-args: VERSION=fork-release
+          provenance: false
+
+      - name: Verify Playwright, Camoufox, service and frontend in the runtime image
+        timeout-minutes: 3
+        run: docker run --rm --network none --entrypoint node aistudio-validation:${{ github.sha }} scripts/ci/verify-runtime.js
 
       - name: Log into GHCR
         uses: docker/login-action@v4
@@ -45,6 +69,7 @@ jobs:
             type=sha,prefix=fork-release-sha-
 
       - name: Build and push image
+        id: publish-image
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -56,3 +81,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: VERSION=fork-release
           provenance: false
+
+      - name: Record published image
+        env:
+          IMAGE_DIGEST: ${{ steps.publish-image.outputs.digest }}
+        run: |
+          echo "Image: $IMAGE_NAME@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          echo "Revision: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
